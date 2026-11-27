@@ -2,7 +2,7 @@
 //! so fence signals complete at once.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -528,6 +528,15 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        if lists
+            .iter()
+            .any(|&list| !crate::list::submission_valid(list))
+        {
+            tracing::warn!(
+                "submission reuses released dynamic descriptor tables without Reset; dropped"
+            );
+            return;
+        }
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
             return;
@@ -779,10 +788,18 @@ impl Written {
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {
             if bytes == 4 {
-                at.cast::<u32>().write_unaligned(value as u32);
+                if at.cast::<AtomicU32>().is_aligned() {
+                    AtomicU32::from_ptr(at.cast()).store(value as u32, Ordering::Release);
+                } else {
+                    at.cast::<u32>().write_unaligned(value as u32);
+                }
+            } else if at.cast::<AtomicU64>().is_aligned() {
+                AtomicU64::from_ptr(at.cast()).store(value, Ordering::Release);
             } else {
                 at.cast::<u64>().write_unaligned(value);
             }
+            #[cfg(windows)]
+            windows_sys::Win32::System::Threading::WakeByAddressAll(at.cast());
         }
     }
 }
@@ -1167,5 +1184,62 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+    #[test]
+    fn written_values_preserve_unaligned_destinations_and_widths() {
+        let mut data = [0xa5u8; 24];
+        let base = data.as_mut_ptr();
+        let offset = usize::from(base.cast::<u64>().is_aligned());
+        let at = unsafe { base.add(offset) };
+        Written::Value(0x0123_4567_89ab_cdef).write(at, 8);
+        assert_eq!(
+            &data[offset..offset + 8],
+            &0x0123_4567_89ab_cdefu64.to_ne_bytes()
+        );
+        assert!(data[..offset].iter().all(|&byte| byte == 0xa5));
+        assert!(data[offset + 8..].iter().all(|&byte| byte == 0xa5));
+        Written::Value(0xfedc_ba98_7654_3210).write(at, 4);
+        assert_eq!(&data[offset..offset + 4], &0x7654_3210u32.to_ne_bytes());
+        assert_eq!(&data[offset + 4..offset + 8], &0x0123_4567u32.to_ne_bytes());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn written_values_wake_windows_address_waiters() {
+        use windows_sys::Win32::System::Threading::WaitOnAddress;
+
+        let value = std::sync::Arc::new(AtomicU64::new(0));
+        let (ready_sent, ready) = std::sync::mpsc::channel();
+        let (done_sent, done) = std::sync::mpsc::channel();
+        let thread_value = std::sync::Arc::clone(&value);
+        let thread = std::thread::spawn(move || {
+            let expected = 0u64;
+            ready_sent.send(()).unwrap();
+            let result = unsafe {
+                WaitOnAddress(
+                    std::sync::Arc::as_ptr(&thread_value).cast(),
+                    (&raw const expected).cast(),
+                    std::mem::size_of::<u64>(),
+                    1000,
+                )
+            };
+            done_sent.send(result).unwrap();
+        });
+        ready
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let pending = done.recv_timeout(std::time::Duration::from_millis(30));
+        Written::Value(7).write(std::sync::Arc::as_ptr(&value).cast_mut().cast(), 8);
+        let result = done.recv_timeout(std::time::Duration::from_secs(2));
+        thread.join().unwrap();
+        assert!(matches!(
+            pending,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_ne!(
+            result.unwrap(),
+            0,
+            "WaitOnAddress timed out instead of being woken"
+        );
+        assert_eq!(value.load(Ordering::Acquire), 7);
     }
 }

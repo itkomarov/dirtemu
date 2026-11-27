@@ -70,6 +70,13 @@ impl Pending {
         }
     }
 
+    fn runs_once(&self) -> bool {
+        self.shaders.iter().any(|shader| {
+            shader.stage == "pixel"
+                && crate::draw::BAKE_PIXEL_SHADERS.contains(&shader.hash.as_str())
+        })
+    }
+
     fn make(&self) {
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
@@ -120,21 +127,87 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
-fn wait_budget(screen: bool) -> Duration {
-    static BUDGETS: OnceLock<[Duration; 2]> = OnceLock::new();
-    BUDGETS.get_or_init(|| {
-        let configured = std::env::var("VICTORY_PIPELINE_WAIT_MS")
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok());
-        let budgets = [configured.unwrap_or(500), configured.unwrap_or(3000)];
-        tracing::info!(
-            millis = budgets[0],
-            screen_millis = budgets[1],
-            "host pipeline wait budget per frame"
-        );
-        budgets.map(Duration::from_millis)
-    })[usize::from(screen)]
+struct WaitBudgets {
+    normal: Duration,
+    screen: Duration,
+    once: Duration,
+}
+
+impl WaitBudgets {
+    fn configured() -> &'static Self {
+        static BUDGETS: OnceLock<WaitBudgets> = OnceLock::new();
+        BUDGETS.get_or_init(|| {
+            let var = |name: &str| std::env::var(name).ok()?.trim().parse::<u64>().ok();
+            let normal = var("VICTORY_PIPELINE_WAIT_MS").unwrap_or(4);
+            let screen = var("VICTORY_PIPELINE_WAIT_SCREEN_MS").unwrap_or(normal);
+            let once = var("VICTORY_PIPELINE_WAIT_ONCE_MS").unwrap_or(500);
+            tracing::info!(
+                millis = normal,
+                screen_millis = screen,
+                once_millis = once,
+                "host pipeline wait budget per frame"
+            );
+            WaitBudgets {
+                normal: Duration::from_millis(normal),
+                screen: Duration::from_millis(screen),
+                once: Duration::from_millis(once),
+            }
+        })
+    }
+
+    fn for_pipeline(&self, pipeline: &Pending) -> (usize, Duration) {
+        if pipeline.runs_once() {
+            (1, self.once.max(self.normal))
+        } else {
+            (
+                0,
+                if pipeline.screen {
+                    self.screen
+                } else {
+                    self.normal
+                },
+            )
+        }
+    }
+}
+
+struct FrameWait {
+    frame: u64,
+    spent: Duration,
+}
+
+impl FrameWait {
+    const fn new() -> Self {
+        Self {
+            frame: u64::MAX,
+            spent: Duration::ZERO,
+        }
+    }
+
+    fn reserve(&mut self, frame: u64, budget: Duration, shared: bool) -> Duration {
+        if self.frame != u64::MAX && self.frame > frame {
+            return Duration::ZERO;
+        }
+        if self.frame != frame {
+            self.frame = frame;
+            self.spent = Duration::ZERO;
+        }
+        let left = budget.saturating_sub(self.spent);
+        if shared {
+            self.spent += left;
+        }
+        left
+    }
+
+    fn finish(&mut self, frame: u64, left: Duration, waited: Duration, shared: bool) {
+        if self.frame == frame {
+            if shared {
+                self.spent = self.spent.saturating_sub(left.saturating_sub(waited));
+            } else {
+                self.spent += waited;
+            }
+        }
+    }
 }
 
 /// Pipelines queued and not made yet.
@@ -192,27 +265,17 @@ fn shared_budget() -> bool {
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending) {
     let frame = crate::queue::presented();
-    let budget = wait_budget(p.screen);
+    let (kind, budget) = WaitBudgets::configured().for_pipeline(p);
     if budget.is_zero() {
         return;
     }
-    // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now).
-    static SPENT: [Mutex<(u64, Duration)>; 2] =
-        [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
-    let spent = &SPENT[usize::from(p.screen)];
+    static SPENT: [Mutex<FrameWait>; 2] = [const { Mutex::new(FrameWait::new()) }; 2];
+    let spent = &SPENT[kind];
     let shared = shared_budget();
-    let left = {
-        let mut spent = spent.lock().unwrap_or_else(|e| e.into_inner());
-        if spent.0 != frame {
-            *spent = (frame, Duration::ZERO);
-        }
-        let left = budget.saturating_sub(spent.1);
-        if shared {
-            spent.1 += left;
-        }
-        left
-    };
+    let left = spent
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .reserve(frame, budget, shared);
     if left.is_zero() {
         return;
     }
@@ -231,17 +294,10 @@ fn wait(p: &Pending) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
-    {
-        let mut spent = spent.lock().unwrap_or_else(|e| e.into_inner());
-        // A frame that began meanwhile has its own budget.
-        if spent.0 == frame {
-            if shared {
-                spent.1 = spent.1.saturating_sub(left - waited);
-            } else {
-                spent.1 += waited;
-            }
-        }
-    }
+    spent
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .finish(frame, left, waited, shared);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
@@ -495,8 +551,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wait_reservations_are_shared_across_recording_threads() {
+        let spent = Mutex::new(FrameWait::new());
+        let barrier = std::sync::Barrier::new(8);
+        let budget = Duration::from_millis(4);
+        let reserved = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        spent.lock().unwrap().reserve(10, budget, true)
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .sum::<Duration>()
+        });
+        assert_eq!(reserved, budget);
+        let mut spent = spent.lock().unwrap();
+        spent.finish(10, budget, Duration::from_millis(1), true);
+        assert_eq!(spent.reserve(10, budget, true), Duration::from_millis(3));
+        assert_eq!(spent.reserve(11, budget, true), budget);
+        assert_eq!(spent.reserve(10, budget, true), Duration::ZERO);
+    }
+
+    #[test]
+    fn only_known_pixel_bakes_get_the_once_wait_budget() {
+        let budgets = WaitBudgets {
+            normal: Duration::from_millis(4),
+            screen: Duration::from_millis(4),
+            once: Duration::from_millis(500),
+        };
+        let shader = |stage, hash: &str| {
+            Arc::new(Shader {
+                stage,
+                hash: hash.into(),
+                container: Vec::new(),
+                translated: OnceLock::new(),
+            })
+        };
+        for hash in crate::draw::BAKE_PIXEL_SHADERS {
+            let bake = Pending::new(vec![shader("pixel", hash)], None);
+            assert_eq!(budgets.for_pipeline(&bake), (1, Duration::from_millis(500)));
+            let compute = Pending::new(vec![shader("compute", hash)], None);
+            assert_eq!(
+                budgets.for_pipeline(&compute),
+                (0, Duration::from_millis(4))
+            );
+        }
+        let mut screen = Pending::new(vec![shader("pixel", "other")], None);
+        screen.screen = true;
+        assert_eq!(budgets.for_pipeline(&screen), (0, Duration::from_millis(4)));
+        let budgets = WaitBudgets {
+            normal: Duration::from_millis(600),
+            screen: Duration::ZERO,
+            once: Duration::from_millis(500),
+        };
+        let bake = Pending::new(
+            vec![shader("pixel", crate::draw::BAKE_PIXEL_SHADERS[0])],
+            None,
+        );
+        assert_eq!(budgets.for_pipeline(&bake), (1, Duration::from_millis(600)));
+        assert_eq!(budgets.for_pipeline(&screen), (0, Duration::ZERO));
+    }
+
+    #[test]
     fn pacing_ticks_do_not_reset_the_pipeline_wait_budget() {
-        let budget = wait_budget(false);
+        let budget = WaitBudgets::configured().normal;
         if budget.is_zero() || budget > Duration::from_secs(2) {
             return;
         }

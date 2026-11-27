@@ -1594,7 +1594,7 @@ fn admit_host_copy(size: u64, windows: Option<&mut BTreeMap<(u64, u64), Arc<Shad
     let needed = used
         .saturating_add(size)
         .saturating_sub(limits.host_copy_bytes);
-    let released = if size > limits.host_copy_bytes {
+    let mut released = if size > limits.host_copy_bytes {
         0
     } else {
         match windows {
@@ -1604,12 +1604,17 @@ fn admit_host_copy(size: u64, windows: Option<&mut BTreeMap<(u64, u64), Arc<Shad
             }),
         }
     };
+    if size <= limits.host_copy_bytes && released < needed {
+        released += BUFFERS.try_lock().ok().map_or(0, |mut buffers| {
+            release_unused_buffers(&mut buffers, needed - released, 0, 0)
+        });
+    }
     if released != 0 {
         used = LIVE[1].load(Ordering::Relaxed);
         tracing::info!(
             released_mb = released >> 20,
             used_mb = used >> 20,
-            "unused host windows released under copy-memory pressure"
+            "unused host copies released under copy-memory pressure"
         );
         if limits.admits_host_copy(used, size) {
             return true;
@@ -1629,19 +1634,60 @@ fn admit_host_copy(size: u64, windows: Option<&mut BTreeMap<(u64, u64), Arc<Shad
     false
 }
 
+fn unused_copy(shadow: &Arc<Shadow>) -> bool {
+    shadow.place.is_none()
+        && Arc::strong_count(shadow) == 1
+        && crate::host::references(&shadow.buffer) == 1
+        && shadow
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+}
+
+fn release_unused_buffers(
+    buffers: &mut BTreeMap<(u64, usize), Entry>,
+    needed: u64,
+    idle_ms: u64,
+    idle_frames: u64,
+) -> u64 {
+    let mut candidates: Vec<_> = buffers
+        .iter()
+        .filter_map(|(key, entry)| {
+            let shadow = entry.shadow.as_ref()?;
+            let used = shadow.used.load(Ordering::Relaxed);
+            (unused_copy(shadow) && crate::host::long_ago(used, idle_ms, idle_frames))
+                .then_some((used, *key))
+        })
+        .collect();
+    candidates.sort_unstable();
+    let mut released = 0;
+    for (_, key) in candidates {
+        if released >= needed {
+            break;
+        }
+        if let Some(entry) = buffers.get_mut(&key)
+            && entry.shadow.as_ref().is_some_and(|shadow| {
+                unused_copy(shadow)
+                    && crate::host::long_ago(
+                        shadow.used.load(Ordering::Relaxed),
+                        idle_ms,
+                        idle_frames,
+                    )
+            })
+            && let Some(shadow) = entry.shadow.take()
+        {
+            released += shadow.len;
+            drop(shadow);
+        }
+    }
+    released
+}
+
 fn release_unused_windows(windows: &mut BTreeMap<(u64, u64), Arc<Shadow>>, needed: u64) -> u64 {
     let mut candidates: Vec<_> = windows
         .iter()
-        .filter(|(_, shadow)| {
-            shadow.place.is_none()
-                && Arc::strong_count(shadow) == 1
-                && crate::host::references(&shadow.buffer) == 1
-                && shadow
-                    .pending
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .is_empty()
-        })
+        .filter(|(_, shadow)| unused_copy(shadow))
         .map(|(key, shadow)| (shadow.used.load(Ordering::Relaxed), *key))
         .collect();
     candidates.sort_unstable();
@@ -1868,6 +1914,13 @@ pub(crate) fn window_use() -> [u64; 8] {
 pub(crate) fn let_go_idle() {
     const IDLE_MS: u64 = 10_000;
     const IDLE_FRAMES: u64 = 4;
+    let released = release_unused_buffers(&mut buffers(), u64::MAX, IDLE_MS, IDLE_FRAMES);
+    if released != 0 {
+        tracing::info!(
+            released_mb = released >> 20,
+            "unused title-buffer host copies released"
+        );
+    }
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -3174,6 +3227,18 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         drop(map);
         return loose(address, end, len <= 1, any);
     };
+    let entry = map.get(&key)?;
+    if entry.shadow.is_none() {
+        let size = (entry.end - key.0).next_multiple_of(1 << 16);
+        let limits = crate::console::limits();
+        let used = LIVE[1].load(Ordering::Relaxed);
+        if !limits.admits_host_copy(used, size) && size <= limits.host_copy_bytes {
+            let needed = used
+                .saturating_add(size)
+                .saturating_sub(limits.host_copy_bytes);
+            release_unused_buffers(&mut map, needed, 0, 0);
+        }
+    }
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
@@ -3250,7 +3315,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         entry.shadow = Some(shadow);
     }
-    entry.shadow.clone()
+    let shadow = entry.shadow.as_ref()?;
+    shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+    Some(shadow.clone())
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
@@ -3660,14 +3727,13 @@ pub(crate) fn near(va: u64) -> String {
 mod pressure_tests {
     use super::*;
 
-    #[test]
-    fn copy_pressure_reclaims_only_unreferenced_windows_without_pending_writes() {
+    fn warp_device() -> windows::Win32::Graphics::Direct3D12::ID3D12Device {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Direct3D12::*;
         use windows::Win32::Graphics::Dxgi::*;
         use windows::core::Interface;
 
-        let device: ID3D12Device = unsafe {
+        unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
             let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
             let description = adapter.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap();
@@ -3675,44 +3741,129 @@ mod pressure_tests {
             let mut device = None;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device).unwrap();
             device.unwrap()
+        }
+    }
+
+    fn warp_shadow(
+        device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+        start: u64,
+        size: u64,
+    ) -> Shadow {
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        let (buffer, data): (ID3D12Resource, *mut u8) = unsafe {
+            let mut buffer = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_UPLOAD,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: size,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut buffer,
+                )
+                .unwrap();
+            let buffer: ID3D12Resource = buffer.unwrap();
+            let mut data = std::ptr::null_mut();
+            buffer.Map(0, None, Some(&mut data)).unwrap();
+            (buffer, data.cast())
         };
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Shadow::new(buffer, data, gpu, start, size)
+    }
+
+    #[test]
+    fn registered_buffer_reclamation_preserves_registration_and_active_copies() {
+        let device = warp_device();
+        const SIZE: u64 = 65536;
+        let mut buffers = BTreeMap::new();
+        for index in 1..=4usize {
+            let start = index as u64 * SIZE;
+            let shadow = Arc::new(warp_shadow(&device, start, SIZE));
+            shadow.used.store(index as u64, Ordering::Relaxed);
+            buffers.insert(
+                (start, index),
+                Entry {
+                    end: start + SIZE,
+                    shadow: Some(shadow),
+                },
+            );
+        }
+        let key = |index: usize| (index as u64 * SIZE, index);
+        let first = Arc::downgrade(buffers[&key(1)].shadow.as_ref().unwrap());
+        let list_pin = buffers[&key(2)].shadow.as_ref().unwrap().clone();
+        let descriptor_pin = buffers[&key(3)].shadow.as_ref().unwrap().buffer.clone();
+        buffers[&key(4)]
+            .shadow
+            .as_ref()
+            .unwrap()
+            .pending
+            .lock()
+            .unwrap()
+            .push((0, 4));
+        assert_eq!(release_unused_buffers(&mut buffers, SIZE * 4, 0, 0), SIZE);
+        assert_eq!(buffers.len(), 4);
+        assert_eq!(buffers[&key(1)].end, 2 * SIZE);
+        assert!(buffers[&key(1)].shadow.is_none());
+        assert!(first.upgrade().is_none());
+        for index in 2..=4 {
+            assert!(buffers[&key(index)].shadow.is_some());
+        }
+        drop(list_pin);
+        drop(descriptor_pin);
+        assert_eq!(release_unused_buffers(&mut buffers, SIZE, 0, 0), SIZE);
+        assert!(buffers[&key(2)].shadow.is_none());
+        assert!(buffers[&key(3)].shadow.is_some());
+        assert_eq!(release_unused_buffers(&mut buffers, SIZE * 4, 0, 0), SIZE);
+        assert!(buffers[&key(4)].shadow.is_some());
+        buffers[&key(4)]
+            .shadow
+            .as_ref()
+            .unwrap()
+            .pending
+            .lock()
+            .unwrap()
+            .clear();
+        assert_eq!(release_unused_buffers(&mut buffers, SIZE, 0, 0), SIZE);
+        assert!(buffers.values().all(|entry| entry.shadow.is_none()));
+        let replacement = Arc::new(warp_shadow(&device, SIZE, SIZE));
+        replacement
+            .used
+            .store(crate::host::moment(), Ordering::Relaxed);
+        unsafe {
+            replacement.data.write(77);
+        }
+        buffers.get_mut(&key(1)).unwrap().shadow = Some(replacement);
+        assert_eq!(release_unused_buffers(&mut buffers, SIZE, 10_000, 4), 0);
+        assert_eq!(
+            unsafe { buffers[&key(1)].shadow.as_ref().unwrap().data.read() },
+            77
+        );
+        assert_eq!(buffers[&key(1)].end, 2 * SIZE);
+    }
+
+    #[test]
+    fn copy_pressure_reclaims_only_unreferenced_windows_without_pending_writes() {
+        let device = warp_device();
         const SIZE: u64 = 65536;
         let mut windows = BTreeMap::new();
         for index in 1..=4 {
-            let (buffer, data): (ID3D12Resource, *mut u8) = unsafe {
-                let mut buffer = None;
-                device
-                    .CreateCommittedResource(
-                        &D3D12_HEAP_PROPERTIES {
-                            Type: D3D12_HEAP_TYPE_UPLOAD,
-                            ..Default::default()
-                        },
-                        D3D12_HEAP_FLAG_NONE,
-                        &D3D12_RESOURCE_DESC {
-                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                            Width: SIZE,
-                            Height: 1,
-                            DepthOrArraySize: 1,
-                            MipLevels: 1,
-                            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
-                                Count: 1,
-                                Quality: 0,
-                            },
-                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                            ..Default::default()
-                        },
-                        D3D12_RESOURCE_STATE_GENERIC_READ,
-                        None,
-                        &mut buffer,
-                    )
-                    .unwrap();
-                let buffer: ID3D12Resource = buffer.unwrap();
-                let mut data = std::ptr::null_mut();
-                buffer.Map(0, None, Some(&mut data)).unwrap();
-                (buffer, data.cast())
-            };
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            let mut shadow = Shadow::new(buffer, data, gpu, index * SIZE, SIZE);
+            let mut shadow = warp_shadow(&device, index * SIZE, SIZE);
             shadow.window = true;
             shadow.used.store(index, Ordering::Relaxed);
             windows.insert((index * SIZE, SIZE), Arc::new(shadow));

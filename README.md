@@ -187,6 +187,9 @@ real 256-state repeat and the physical-page alias correction.
 Offline `--jobs` and runtime `VICTORY_PIPELINE_WORKERS` are separate controls;
 on the four-core RX 570 test machine, use three runtime workers and prepare
 previously used objects with `run --execute --precompile --used-only`.
+The [fork adaptation report](docs/rx570-fork-ports-2026-11-28.md) lists the
+shared frame budgets, fence waits, texture fixes and host-copy reclamation,
+with upstream commits, controls and validation limits.
 The pipeline recording and source fingerprint follow the approach in
 [carlm125/cool_fox](https://github.com/carlm125/cool_fox).
 

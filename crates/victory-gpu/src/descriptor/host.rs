@@ -13,7 +13,10 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -336,45 +339,37 @@ impl TextureQueue {
         self.slots.remove(&index);
     }
 
-    /// Up to `max` slots due at `frame`, each with its write number, in
-    /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
-    ///   only part of it): the look is a query, and memory that has
-    ///   arrived since is what the title streamed in last;
-    /// - then the others, the newest write first and the oldest next, in
-    ///   turns: slot order served the low slots of a backlog of
-    ///   25,000-40,000 while the textures of the shot on screen waited
-    ///   (run 52: 98% of the drawn pixels had no colour texture in the
-    ///   first 3D frames).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
-        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
+        let (mut again, mut fresh) = (Vec::new(), Vec::new());
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
             let class = if w.looks > 0 || w.mapped > 0 {
                 &mut again
             } else {
                 &mut fresh
             };
-            class.push((w.written, index, w.write));
+            class.push((index, w.write));
         }
-        // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again
-            .iter()
-            .map(|&(_, index, write)| (index, write))
-            .collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        again.sort_unstable_by_key(|&(_, write)| write);
+        fresh.sort_unstable_by_key(|&(_, write)| write);
+        let count = max.min(again.len() + fresh.len());
+        let mut fresh = fresh.into_iter();
+        let mut retry = frame & 1 == 0;
+        let mut newest = again.is_empty() || frame & 2 == 0;
+        let mut order = Vec::with_capacity(count);
+        while order.len() < count {
+            if !again.is_empty() && (retry || fresh.len() == 0) {
+                order.push(again.pop().unwrap());
+            } else {
+                let next = if newest {
+                    fresh.next_back()
+                } else {
+                    fresh.next()
+                };
+                order.push(next.unwrap());
+                newest = !newest;
             }
+            retry = !retry;
         }
-        order.truncate(max);
         order
     }
 
@@ -673,6 +668,7 @@ impl HostHeap {
             })
             .flatten();
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             heap,
             cpu,
             step,
@@ -1150,18 +1146,34 @@ impl HostHeap {
         stale
     }
 
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
     /// returned).
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
+        let end = at.saturating_add(n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
             let given = slots.iter().filter(|taken| **taken).count() as u32;
+            let mut retired = Vec::new();
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            for (offset, taken) in slots.iter().enumerate() {
+                if *taken && let Some(resource) = kept[first as usize + offset].take() {
+                    retired.push(resource);
+                }
+            }
+            drop(kept);
+            drop(retired);
             self.free
                 .fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long
@@ -2918,11 +2930,6 @@ mod tests {
         assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
     }
 
-    /// The queue of textures picked by index serves the slots looked at
-    /// before first, then the newest write and the oldest in turns; a
-    /// slot whose memory is not there is looked at again after
-    /// 1, 2, 4 frames up to the limit; and what the pass reports about a
-    /// slot written again meanwhile is dropped.
     #[test]
     fn the_texture_queue_serves_the_newest_writes_first() {
         let mut q = TextureQueue::default();
@@ -2950,7 +2957,6 @@ mod tests {
             q.later(17, w17, frame, 4);
             assert!(!q.due(frame + wait - 1, 100).iter().any(|d| d.0 == 17));
             frame += wait;
-            // Due again, and ahead of every slot never looked at.
             assert_eq!(q.due(frame, 100)[0].0, 17);
         }
         assert_eq!(q.census(9)[2], 1);
@@ -3112,6 +3118,62 @@ mod tests {
     }
 
     #[test]
+    fn texture_queue_keeps_first_looks_in_a_retry_backlog() {
+        let mut q = TextureQueue::default();
+        for index in 0..10 {
+            q.written(index, 0, 0, false);
+        }
+        for (index, write) in q.due(0, 10) {
+            q.later(index, write, 0, 4);
+        }
+        for index in 10..20 {
+            q.written(index, 1, 1, false);
+        }
+        let slots = |frame, max| {
+            q.due(frame, max)
+                .into_iter()
+                .map(|d| d.0)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(slots(1, 4), [19, 9, 10, 8]);
+        assert_eq!(slots(2, 4), [9, 10, 8, 19]);
+        assert_eq!(slots(3, 1), [10]);
+        assert_eq!(slots(4, 1), [9]);
+        assert_eq!(slots(5, 1), [19]);
+        assert!(slots(5, 0).is_empty());
+    }
+
+    #[test]
+    fn dynamic_release_unpins_only_completed_ranges_of_the_same_heap() {
+        let heap = HostHeap::new(false, 4).expect("D3D12 host heap for regression test");
+        let host = crate::host::host().expect("D3D12 device for regression test");
+        let (resource, _) = host.upload_buffer(64).expect("real resource");
+        let baseline = crate::host::references(&resource);
+        let a = heap.dynamic(2).unwrap();
+        let b = heap.dynamic(1).unwrap();
+        for index in [0, a, a + 1, b] {
+            heap.keep(index, Some(resource.clone()));
+        }
+        assert_eq!(crate::host::references(&resource), baseline + 4);
+        let free = heap.free.load(std::sync::atomic::Ordering::Relaxed);
+        heap.release(heap.id() + 1, a, 2);
+        assert_eq!(heap.free.load(std::sync::atomic::Ordering::Relaxed), free);
+        assert_eq!(crate::host::references(&resource), baseline + 4);
+        heap.release(heap.id(), a, 2);
+        assert_eq!(
+            heap.free.load(std::sync::atomic::Ordering::Relaxed),
+            free + 2
+        );
+        assert_eq!(crate::host::references(&resource), baseline + 2);
+        heap.release(heap.id(), b, 1);
+        assert_eq!(crate::host::references(&resource), baseline + 1);
+        heap.release(heap.id(), 0, 1);
+        assert_eq!(crate::host::references(&resource), baseline + 1);
+        drop(heap);
+        assert_eq!(crate::host::references(&resource), baseline);
+    }
+
+    #[test]
     fn dynamic_slots_are_held_until_released() {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
@@ -3121,7 +3183,7 @@ mod tests {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }

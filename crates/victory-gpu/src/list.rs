@@ -174,6 +174,19 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn submission_valid(this: This) -> bool {
+    if this.is_null() {
+        return true;
+    }
+    let list = unsafe { &*this.cast::<List>() };
+    !list
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .tables_expired()
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.

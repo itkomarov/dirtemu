@@ -533,8 +533,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     }
 }
 
-
-fn claim_upload(uploaded: &std::sync::atomic::AtomicBool, dirty: &std::sync::atomic::AtomicBool) -> bool {
+fn claim_upload(
+    uploaded: &std::sync::atomic::AtomicBool,
+    dirty: &std::sync::atomic::AtomicBool,
+) -> bool {
     use std::sync::atomic::Ordering::AcqRel;
     let uploaded = uploaded.swap(true, AcqRel);
     let dirty = dirty.swap(false, AcqRel);
@@ -548,13 +550,16 @@ mod upload_order_tests {
 
     #[test]
     fn three_video_surfaces_upload_every_changed_frame() {
-        let ring: [(AtomicBool, AtomicBool); 3] = std::array::from_fn(|_| (AtomicBool::new(false), AtomicBool::new(true)));
+        let ring: [(AtomicBool, AtomicBool); 3] =
+            std::array::from_fn(|_| (AtomicBool::new(false), AtomicBool::new(true)));
         let mut card = [0; 3];
         for frame in 1..20 {
             let slot = frame % 3;
             let (uploaded, dirty) = &ring[slot];
             dirty.store(true, Release);
-            if claim_upload(uploaded, dirty) { card[slot] = frame; }
+            if claim_upload(uploaded, dirty) {
+                card[slot] = frame;
+            }
             assert_eq!(card[slot], frame);
             assert!(!claim_upload(uploaded, dirty));
         }
@@ -571,12 +576,16 @@ impl Staging {
             let destination = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: unsafe { std::mem::transmute_copy(texture) },
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index as u32 },
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: index as u32,
+                },
             };
             let source = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: unsafe { std::mem::transmute_copy(&self.buffer) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: *footprint,
+                },
             };
             unsafe { list.CopyTextureRegion(&destination, 0, 0, 0, &source, None) };
         }
@@ -923,9 +932,7 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// How many bytes of `[at, at + len)` are committed memory: all of a
 /// texture that is there, some of one streaming in (its smaller mips lie
 /// at the start of its memory, and their pages are mapped first), none of
-/// one not there. With neither the first nor the last page committed the
-/// answer is none without a look at the pages between (two queries for the
-/// slots whose texture is away, which are asked again and again).
+/// one not there.
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
@@ -933,10 +940,12 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     }
     let start = at as usize;
     let end = start.saturating_add(len);
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+    let query = by_query();
+    let ends_missing = !query && !committed(at, 1) && !committed((end - 1) as *const u8, 1);
+    if ends_missing && (end - 1) / 4096 - start / 4096 <= 1 {
         return 0;
     }
-    if !by_query() {
+    if !query && !ends_missing {
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *BY_PAGE
             .get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1"))
@@ -1133,7 +1142,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         && total <= limits.staging_bytes
         && STAGED[1].load(Relaxed).saturating_add(total) > limits.staging_bytes
     {
-        let mut idle: Vec<_> = map.iter()
+        let mut idle: Vec<_> = map
+            .iter()
             .filter(|(_, staging)| Arc::strong_count(staging) == 1)
             .map(|(&key, staging)| (staging.used.load(Relaxed), key))
             .collect();
@@ -1228,6 +1238,26 @@ mod mip_budget_tests {
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn mapped_bytes_detects_an_interior_resident_page() {
+        use windows_sys::Win32::System::Memory::*;
+        unsafe {
+            let base =
+                VirtualAlloc(std::ptr::null(), 3 * 4096, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(
+                VirtualAlloc(base.add(4096).cast(), 4096, MEM_COMMIT, PAGE_READWRITE),
+                base.add(4096).cast()
+            );
+            base.add(4096).write_bytes(0x5a, 4096);
+            assert_eq!(super::mapped_bytes(base, 3 * 4096), 4096);
+            assert_eq!(super::mapped_bytes(base, 0), 0);
+            assert_eq!(super::mapped_bytes(base, 4096), 0);
+            assert_eq!(super::mapped_bytes(base.add(1024), 2 * 4096), 4096);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does

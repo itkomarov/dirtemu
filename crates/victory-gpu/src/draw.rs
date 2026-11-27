@@ -27,6 +27,124 @@ use crate::pipeline::host::{HostPipeline, Stage};
 mod ambient;
 mod mesh;
 
+pub(crate) const BAKE_PIXEL_SHADERS: [&str; 4] = [
+    "c0a7fe77b1862e10",
+    "0d1575a396dfe513",
+    "b7cfd8dda91ebb6b",
+    "280967ad158cee0b",
+];
+
+struct TextureStageLimits {
+    shared: bool,
+    span: std::time::Duration,
+    bytes: u64,
+}
+
+impl TextureStageLimits {
+    fn configured() -> &'static Self {
+        static LIMITS: std::sync::OnceLock<TextureStageLimits> = std::sync::OnceLock::new();
+        LIMITS.get_or_init(|| {
+            let var = |name: &str| std::env::var(name).ok()?.trim().parse::<u64>().ok();
+            let shared =
+                std::env::var_os("VICTORY_TEXTURE_STAGE_PER_FRAME").is_none_or(|v| v != "0");
+            let span = var("VICTORY_TEXTURE_STAGE_US")
+                .map(std::time::Duration::from_micros)
+                .unwrap_or_else(|| {
+                    std::time::Duration::from_millis(
+                        var("VICTORY_TEXTURE_STAGE_MS").unwrap_or(if shared { 6 } else { 250 }),
+                    )
+                });
+            let bytes = var("VICTORY_TEXTURE_STAGE_BYTES").unwrap_or_else(|| {
+                var("VICTORY_TEXTURE_STAGE_MB")
+                    .unwrap_or(192)
+                    .saturating_mul(1 << 20)
+            });
+            tracing::info!(
+                shared,
+                micros = span.as_micros() as u64,
+                bytes,
+                "texture staging budget"
+            );
+            TextureStageLimits {
+                shared,
+                span,
+                bytes,
+            }
+        })
+    }
+}
+
+struct TextureStageBudget {
+    frame: u64,
+    elapsed: std::time::Duration,
+}
+
+impl TextureStageBudget {
+    const fn new() -> Self {
+        Self {
+            frame: u64::MAX,
+            elapsed: std::time::Duration::ZERO,
+        }
+    }
+
+    fn begin(
+        budget: &std::sync::Mutex<Self>,
+        frame: u64,
+        shared: bool,
+        span: std::time::Duration,
+    ) -> Option<TextureStagePass<'_>> {
+        let mut held = if shared {
+            let mut held = match budget.try_lock() {
+                Ok(held) => held,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+            };
+            if held.frame != u64::MAX && held.frame > frame {
+                return None;
+            }
+            if held.frame != frame {
+                held.frame = frame;
+                held.elapsed = std::time::Duration::ZERO;
+            }
+            Some(held)
+        } else {
+            None
+        };
+        let left = span.saturating_sub(
+            held.as_mut()
+                .map_or(std::time::Duration::ZERO, |held| held.elapsed),
+        );
+        if left.is_zero() {
+            return None;
+        }
+        Some(TextureStagePass {
+            held,
+            began: std::time::Instant::now(),
+            left,
+        })
+    }
+}
+
+struct TextureStagePass<'a> {
+    held: Option<std::sync::MutexGuard<'a, TextureStageBudget>>,
+    began: std::time::Instant,
+    left: std::time::Duration,
+}
+
+impl TextureStagePass<'_> {
+    fn exhausted(&self) -> bool {
+        self.began.elapsed() >= self.left
+    }
+}
+
+impl Drop for TextureStagePass<'_> {
+    fn drop(&mut self) {
+        if let Some(held) = &mut self.held {
+            held.elapsed = held.elapsed.saturating_add(self.began.elapsed());
+        }
+    }
+}
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -194,7 +312,7 @@ pub(crate) struct State {
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -204,12 +322,13 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    tables_expired: bool,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for &(heap, id, first, n) in &self.dynamic {
+            crate::descriptor::release_dynamic(heap, id, first, n);
         }
     }
 }
@@ -222,7 +341,12 @@ impl State {
     /// slots out, and up to 4,900 draws a frame went without their tables.
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
+    pub(crate) fn tables_expired(&self) -> bool {
+        self.tables_expired
+    }
+
     pub(crate) fn tables_done(&mut self) {
+        self.tables_expired |= !self.dynamic.is_empty();
         if self.tables_gone && self.dynamic.is_empty() {
             return;
         }
@@ -232,8 +356,8 @@ impl State {
                 tracing::warn!("a list ran again after its descriptor tables were given back")
             });
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for (heap, id, first, n) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, id, first, n);
         }
         self.fresh_tables.clear();
         self.root_srv_slots.clear();
@@ -1255,7 +1379,7 @@ impl State {
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.id(), index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -1335,7 +1459,7 @@ impl State {
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.id(), index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -1585,12 +1709,19 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
-        /// Bytes of texture memory staged per frame.
-        const PER_FRAME: u64 = 192 << 20;
+        static TIME: std::sync::Mutex<TextureStageBudget> =
+            std::sync::Mutex::new(TextureStageBudget::new());
+        let limits = TextureStageLimits::configured();
+        let Some(stage) =
+            TextureStageBudget::begin(&TIME, crate::queue::presented(), limits.shared, limits.span)
+        else {
+            return;
+        };
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
-        if FRAME.swap(frame, Ordering::Relaxed) != frame {
+        let budget_frame = crate::queue::presented();
+        if FRAME.swap(budget_frame, Ordering::Relaxed) != budget_frame {
             SPENT.store(0, Ordering::Relaxed);
         }
         // No more of them are made while the card has no room
@@ -1637,14 +1768,8 @@ impl State {
             user_data: 0,
             slot: 0,
         };
-        // Also within a time per pass: the pass runs on a thread that
-        // records the frame, and making and staging 192 MB of textures took
-        // 1.6-2.2 s of each of the world's first twenty frames (run 20).
-        // The rest waits for the next frames, as it does past the bytes.
-        const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
-        let began = std::time::Instant::now();
-        for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > SPAN {
+        for (look, (index, write)) in due.into_iter().enumerate() {
+            if SPENT.load(Ordering::Relaxed) >= limits.bytes || (look != 0 && stage.exhausted()) {
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
@@ -2200,7 +2325,7 @@ impl State {
             };
             self.fresh_tables.insert(key, first);
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+                .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -2974,6 +3099,59 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_dynamic_tables_require_a_new_recording_before_resubmission() {
+        let mut state = State::default();
+        state.tables_done();
+        assert!(!state.tables_expired());
+        state.dynamic.push((0, 1, 4, 1));
+        state.tables_gone = false;
+        state.tables_done();
+        assert!(state.tables_expired());
+        state.tables_done();
+        assert!(state.tables_expired());
+        state = State::default();
+        assert!(!state.tables_expired());
+    }
+
+    #[test]
+    fn texture_stage_budget_is_shared_and_does_not_wait_for_another_recorder() {
+        let budget = std::sync::Mutex::new(TextureStageBudget::new());
+        let span = std::time::Duration::from_secs(1);
+        let first = TextureStageBudget::begin(&budget, 10, true, span).unwrap();
+        std::thread::scope(|scope| {
+            assert!(
+                scope
+                    .spawn(|| TextureStageBudget::begin(&budget, 10, true, span).is_none())
+                    .join()
+                    .unwrap()
+            );
+        });
+        drop(first);
+        let next = TextureStageBudget::begin(&budget, 10, true, span).unwrap();
+        assert!(next.left < span);
+        drop(next);
+        let fresh = TextureStageBudget::begin(&budget, 11, true, span).unwrap();
+        assert_eq!(fresh.left, span);
+        drop(fresh);
+        assert!(TextureStageBudget::begin(&budget, 10, true, span).is_none());
+    }
+
+    #[test]
+    fn texture_stage_overrun_exhausts_the_frame_even_on_early_return() {
+        let budget = std::sync::Mutex::new(TextureStageBudget::new());
+        let span = std::time::Duration::from_millis(1);
+        let work = || {
+            let pass = TextureStageBudget::begin(&budget, 20, true, span).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            assert!(pass.exhausted());
+        };
+        work();
+        assert!(TextureStageBudget::begin(&budget, 20, true, span).is_none());
+        assert!(TextureStageBudget::begin(&budget, 21, true, span).is_some());
+        assert!(TextureStageBudget::begin(&budget, 21, true, std::time::Duration::ZERO).is_none());
+    }
 
     struct TestTexture(This);
 
