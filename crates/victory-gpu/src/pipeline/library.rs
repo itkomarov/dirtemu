@@ -634,9 +634,16 @@ pub(crate) fn pipeline(
     // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
     TRIMMED.store(false, Ordering::Relaxed);
+    let trace = std::env::var_os("VICTORY_PIPELINE_CACHE_TRACE").is_some();
+    let load_ms = began.elapsed().as_secs_f64() * 1e3;
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
+            if trace {
+                LABEL.with(|label| {
+                    tracing::info!(%name, shaders = %label.borrow(), load_ms, "pipeline cache hit");
+                });
+            }
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!(
@@ -648,12 +655,20 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
+    if trace {
+        LABEL.with(|label| {
+            tracing::info!(%name, shaders = %label.borrow(), load_ms, error = %refused, "pipeline cache miss");
+        });
+    }
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
         create()?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
+    if trace {
+        tracing::info!(%name, elapsed_ms = began.elapsed().as_secs_f64() * 1e3, "pipeline cache compilation finished");
+    }
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(

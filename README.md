@@ -180,6 +180,13 @@ the preparation identity changes. Previously used pipeline objects are loaded
 into the game process before execution.
 Measurements and the unresolved compiler fault are recorded in
 [the RX 570 preparation report](docs/rx570-precompile-2026-11-27.md).
+Successful driver library loads can still be expensive on a first pass.
+Set `VICTORY_PIPELINE_CACHE_TRACE=1` to distinguish loads from misses and time
+both paths. The [follow-up report](docs/rx570-resume-2026-11-28.md) records a
+real 256-state repeat and the physical-page alias correction.
+Offline `--jobs` and runtime `VICTORY_PIPELINE_WORKERS` are separate controls;
+on the four-core RX 570 test machine, use three runtime workers and prepare
+previously used objects with `run --execute --precompile --used-only`.
 The pipeline recording and source fingerprint follow the approach in
 [carlm125/cool_fox](https://github.com/carlm125/cool_fox).
 

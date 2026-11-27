@@ -120,7 +120,13 @@ pub extern "system" fn XMemVirtualAlloc(
         if kind & MEM_REPLACE_PLACEHOLDER != 0 {
             // Part of a placeholder the title split: it stays one.
             if trace_on() {
-                tracing::info!(base = format_args!("{base:p}"), size, kind = format_args!("{kind:#x}"), flags = format_args!("{flags:#x}"), "XMemVirtualAlloc replace");
+                tracing::info!(
+                    base = format_args!("{base:p}"),
+                    size,
+                    kind = format_args!("{kind:#x}"),
+                    flags = format_args!("{flags:#x}"),
+                    "XMemVirtualAlloc replace"
+                );
             }
             return base;
         }
@@ -734,27 +740,34 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
-    // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
-        let at = from + k;
-        let Some(slice) = physical
-            .views
-            .range(..=at)
-            .next_back()
-            .filter(|(base, (size, _))| at < *base + size)
-            .map(|(base, (_, s))| Slice {
-                index: s.index + (at - base) / PAGE,
-                section: s.section.clone(),
+    let slices = if from == 0 {
+        Vec::new()
+    } else {
+        let Some(slices) = (0..len)
+            .step_by(PAGE)
+            .map(|k| {
+                let at = from + k;
+                physical
+                    .views
+                    .range(..=at)
+                    .next_back()
+                    .filter(|(base, (size, _))| at < *base + size)
+                    .map(|(base, (_, s))| Slice {
+                        index: s.index + (at - base) / PAGE,
+                        section: s.section.clone(),
+                    })
             })
+            .collect::<Option<Vec<_>>>()
         else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        slices
+    };
+    // As in `XMemMapPhysicalPages`: no read in place meets the gap.
+    let _changing = victory_gpu::title_memory_remapping();
+    unmap(&mut physical, to, len);
+    for (k, slice) in slices.into_iter().enumerate() {
+        if !map(&mut physical, to + k * PAGE, PAGE, slice) {
             return false;
         }
     }
@@ -802,7 +815,12 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view(
+        base,
+        len,
+        slice.section.0 as usize,
+        (slice.index * PAGE) as u64,
+    );
     physical.views.insert(base, (len, slice));
     true
 }
@@ -1217,6 +1235,112 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    #[test]
+    fn aliasing_a_view_to_itself_preserves_its_contents() {
+        let pages = allocate(3);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            3 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        for (index, value) in [11u8, 22, 33].into_iter().enumerate() {
+            let at = a.wrapping_byte_add(index * PAGE);
+            unsafe { std::slice::from_raw_parts_mut(at.cast::<u8>(), PAGE).fill(value) };
+        }
+        assert!(map_alias(a as u64, a as u64, 3 * PAGE as u64));
+        for (index, value) in [11u8, 22, 33].into_iter().enumerate() {
+            let at = a.wrapping_byte_add(index * PAGE);
+            assert_eq!(query(at).host.State, MEM_COMMIT);
+            assert!(
+                unsafe { std::slice::from_raw_parts(at.cast::<u8>(), PAGE) }
+                    .iter()
+                    .all(|&byte| byte == value)
+            );
+        }
+        assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn overlapping_aliases_keep_the_original_source_pages() {
+        let pages = allocate(3);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            3 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        for (index, value) in [11u8, 22, 33].into_iter().enumerate() {
+            let at = a.wrapping_byte_add(index * PAGE);
+            unsafe { std::slice::from_raw_parts_mut(at.cast::<u8>(), PAGE).fill(value) };
+        }
+        assert!(map_alias(
+            a.wrapping_byte_add(PAGE) as u64,
+            a as u64,
+            2 * PAGE as u64,
+        ));
+        for (index, value) in [11u8, 11, 22].into_iter().enumerate() {
+            let at = a.wrapping_byte_add(index * PAGE);
+            assert_eq!(query(at).host.State, MEM_COMMIT);
+            assert!(
+                unsafe { std::slice::from_raw_parts(at.cast::<u8>(), PAGE) }
+                    .iter()
+                    .all(|&byte| byte == value)
+            );
+        }
+        assert!(write_physical(&pages[1..2], 1, &[44]));
+        assert_eq!(
+            unsafe { a.wrapping_byte_add(2 * PAGE + 1).cast::<u8>().read() },
+            44
+        );
+        assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn an_unmapped_alias_source_preserves_the_destination() {
+        let pages = allocate(2);
+        let reserve = |size| {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                size,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        let (a, b) = (reserve(3 * PAGE), reserve(2 * PAGE));
+        assert!(!a.is_null() && !b.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 2, pages.as_ptr()), b);
+        for (index, value) in [11u8, 22].into_iter().enumerate() {
+            let at = a.wrapping_byte_add(index * PAGE);
+            unsafe { std::slice::from_raw_parts_mut(at.cast::<u8>(), PAGE).fill(value) };
+        }
+        for from in [a.wrapping_byte_add(PAGE), a.wrapping_byte_add(2 * PAGE)] {
+            assert!(!map_alias(b as u64, from as u64, 2 * PAGE as u64));
+            for (index, value) in [11u8, 22].into_iter().enumerate() {
+                let at = b.wrapping_byte_add(index * PAGE);
+                assert_eq!(query(at).host.State, MEM_COMMIT);
+                assert!(
+                    unsafe { std::slice::from_raw_parts(at.cast::<u8>(), PAGE) }
+                        .iter()
+                        .all(|&byte| byte == value)
+                );
+            }
+        }
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 2, std::ptr::null()), b);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 
     /// A thread that reads a mapped page in place, as the GPU side reads a
