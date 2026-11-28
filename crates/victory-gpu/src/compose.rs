@@ -1,4 +1,4 @@
-﻿//! Two presented planes as one image: the console's display puts the second
+//! Two presented planes as one image: the console's display puts the second
 //! (the interface) over the first (the scene), each scaled to the screen.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -209,7 +209,7 @@ pub(crate) fn view(d: &D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
     }
 }
 
-#[cfg(all(test, feature = "diagnostics"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

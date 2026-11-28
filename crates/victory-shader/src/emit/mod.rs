@@ -84,7 +84,13 @@ mod barycentrics;
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
+mod counter_store_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(all(test, windows))]
+mod fmac_tests;
+#[cfg(all(test, windows))]
+mod half32_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
@@ -1901,6 +1907,144 @@ mod barycentric_tests {
         assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
         assert_eq!(texcoord_mode(&shader), 1);
         validate(&shader);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn first_half_partial_values_render_exactly() {
+        use super::bitcode::{Attr, Term};
+        use super::host::Draw;
+        use super::shader::Shader;
+
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (host, _settings) = match super::lower::tests::shader_regression_host() {
+            Ok(device) => device,
+            Err(error) => {
+                if std::env::var_os("VICTORY_TEST_D3D12_SDK_PATH").is_some() {
+                    panic!("configured interpolation device: {error}");
+                }
+                eprintln!("SKIP no interpolation test device: {error}");
+                return;
+            }
+        };
+        let mut vertex = Shader::new(false, host.profile());
+        vertex.inputs = vec![element("POSITION", 0, 0), element("TEXCOORD", 0, 1)];
+        vertex.outputs = vec![element("TEXCOORD", 0, 0), element("SV_Position", 3, 1)];
+        for input in &mut vertex.inputs {
+            input.usage = 15;
+        }
+        for (index, output) in vertex.outputs.iter_mut().enumerate() {
+            output.usage = 15;
+            output.interp = if index == 1 { 4 } else { 2 };
+        }
+        for row in 0..2 {
+            for column in 0..4 {
+                let args = [
+                    vertex.m.i32(row),
+                    vertex.m.i32(0),
+                    vertex.m.i8(column),
+                    vertex.m.undef(vertex.t.i32),
+                ];
+                let value = vertex.op(
+                    vertex.entry,
+                    "loadInput.f32",
+                    Attr::ReadNone,
+                    vertex.t.f32,
+                    4,
+                    &args,
+                );
+                let args = [
+                    vertex.m.i32(1 - row),
+                    vertex.m.i32(0),
+                    vertex.m.i8(column),
+                    value,
+                ];
+                vertex.op(
+                    vertex.entry,
+                    "storeOutput.f32",
+                    Attr::NoUnwind,
+                    vertex.t.void,
+                    5,
+                    &args,
+                );
+            }
+        }
+        vertex.m.terminate(vertex.entry, Term::Ret);
+        let vertex = HostShader {
+            stage: HwStage::Vs,
+            profile: host.profile(),
+            descriptor_aliases: Vec::new(),
+            direct_heap: false,
+            dxil: vertex.finish(),
+            mesh_fallback: None,
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
+        };
+        let vertices = [
+            -1.0, 1.0, 0.5, 1.0, 2.0, 0.0, 0.0, 0.0, -1.0, -3.0, 0.5, 1.0, 6.0, 0.0, 0.0, 0.0, 3.0,
+            1.0, 0.5, 1.0, 10.0, 0.0, 0.0, 0.0,
+        ];
+        let mut validator =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+                .expect("DXIL validator");
+        validator.validate(&mut vertex.dxil.clone()).unwrap();
+        for paired in [false, true] {
+            let mut words = vec![0xC808_0000];
+            if paired {
+                words.extend([0x7E06_0302, 0xC809_0001, v_add_f32(2, 2, 3)]);
+            }
+            words.extend(exp_mrt0(2));
+            words.push(S_ENDPGM);
+            let pixel = pixel(&words, PERSP_CENTER).unwrap();
+            validator.validate(&mut pixel.dxil.clone()).unwrap();
+            let geometry = barycentric_gs(&vertex.dxil, &pixel.dxil).unwrap();
+            if let Some(geometry) = &geometry {
+                validator.validate(&mut geometry.clone()).unwrap();
+            }
+            let root = host.root_signature(&vertex, &pixel).unwrap();
+            let pipeline = host
+                .pipeline_with_gs(&root, &vertex.dxil, geometry.as_deref(), &pixel.dxil)
+                .unwrap();
+            let readback = host
+                .draw(
+                    &root,
+                    &pipeline,
+                    &Draw {
+                        roots: Vec::new(),
+                        aliases: &[],
+                        textures: &[],
+                        samplers: &[],
+                        vertices: &vertices,
+                        stride: 32,
+                        size: (8, 8),
+                        mesh_groups: 0,
+                    },
+                )
+                .unwrap();
+            for (index, texel) in readback.iter().enumerate() {
+                let i = (index / 8) as f32 / 16.0 + 0.5 / 16.0;
+                let j = (index % 8) as f32 / 16.0 + 0.5 / 16.0;
+                let partial = 2.0 + 4.0 * i;
+                let expected = if paired {
+                    partial + 2.0 + 4.0 * i + 8.0 * j
+                } else {
+                    partial
+                };
+                for actual in texel {
+                    assert!(
+                        (actual - expected).abs() < 0.00001,
+                        "paired={paired} pixel={index}: {actual} != {expected}"
+                    );
+                }
+            }
+        }
     }
 
     /// P10 of an attribute the program interpolates is P1 - P0.

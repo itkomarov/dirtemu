@@ -15,6 +15,7 @@ pub fn run(
     precompile: bool,
     used_only: bool,
     record_pipelines: bool,
+    precompile_bakes: bool,
 ) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
@@ -34,7 +35,7 @@ pub fn run(
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     console.select();
-    if precompile || record_pipelines {
+    if precompile || record_pipelines || precompile_bakes {
         crate::precompile::record(&cfg, hash.as_str(), console)?;
     }
     if precompile {
@@ -47,7 +48,19 @@ pub fn run(
             None,
             used_only,
             true,
+            false,
         )?;
+    }
+    if precompile_bakes {
+        let report = victory_gpu::pipeline::precompile_bake_pipelines(2)?;
+        println!(
+            "bootstrap bakes {} ready, {} refused, {} unreadable",
+            report.built, report.refused, report.unreadable
+        );
+        anyhow::ensure!(
+            report.refused == 0 && report.unreadable == 0,
+            "one-time bake preparation did not complete successfully"
+        );
     }
     let image = victory_loader::load(&prepared, &images)?;
     // The program is mapped from the copy `load` wrote: the file's bytes
@@ -160,7 +173,7 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
-    if precompile || record_pipelines {
+    if precompile || record_pipelines || precompile_bakes {
         victory_gpu::pipeline::save_pipeline_cache();
     }
     println!("title exited with {code}");
@@ -382,6 +395,7 @@ pub fn run(
     _: bool,
     _: bool,
     _: Console,
+    _: bool,
     _: bool,
     _: bool,
     _: bool,

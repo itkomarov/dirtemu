@@ -157,6 +157,12 @@ pub struct Tail {
     pub y: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Allocation {
+    pub size: u64,
+    pub alignment: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     pub desc: Desc,
@@ -263,6 +269,18 @@ const BLOCK_1K_3D: [[u32; 3]; 5] = [[16, 8, 8], [8, 8, 8], [8, 8, 4], [8, 4, 4],
 
 impl Layout {
     pub fn new(desc: &Desc) -> Result<Layout, Error> {
+        Self::build(desc, true)
+    }
+
+    pub fn allocation(desc: &Desc) -> Result<Allocation, Error> {
+        let layout = Self::build(desc, false)?;
+        Ok(Allocation {
+            size: layout.size,
+            alignment: layout.alignment,
+        })
+    }
+
+    fn build(desc: &Desc, full: bool) -> Result<Layout, Error> {
         let d = *desc;
         let block_log2 = d.swizzle.block_log2().ok_or(Error::Invalid)?;
         let valid = (1..=MAX_EXTENT).contains(&d.width)
@@ -282,15 +300,15 @@ impl Layout {
             return Err(Error::Invalid);
         }
         if block_log2 == 0 {
-            Ok(Layout::linear(d))
+            Ok(Layout::linear(d, full))
         } else {
-            Ok(Layout::tiled(d, block_log2))
+            Ok(Layout::tiled(d, block_log2, full))
         }
     }
 
     /// `HwlComputeSurfaceInfoLinear`: rows aligned to 256 bytes, mips packed
     /// smallest first, a 3D texture's depth slices each hold the chain.
-    fn linear(d: Desc) -> Layout {
+    fn linear(d: Desc, full: bool) -> Layout {
         let bpe = u64::from(d.element_bytes);
         let align = 256 / d.element_bytes;
         let three_d = d.dimension == Dimension::Tex3d;
@@ -299,16 +317,18 @@ impl Layout {
         for i in (0..d.mips).rev() {
             let h = padded_dim(d.height, i, d.block);
             let pitch = padded_dim(d.width, i, d.block).next_multiple_of(align);
-            mips.push(Mip {
-                width: dim(d.width, i, d.block),
-                height: dim(d.height, i, d.block),
-                depth: if three_d { dim(d.depth, i, 1) } else { 1 },
-                pitch,
-                rows: h,
-                depth_pitch: if three_d { d.depth } else { 1 },
-                offset,
-                tail: None,
-            });
+            if full {
+                mips.push(Mip {
+                    width: dim(d.width, i, d.block),
+                    height: dim(d.height, i, d.block),
+                    depth: if three_d { dim(d.depth, i, 1) } else { 1 },
+                    pitch,
+                    rows: h,
+                    depth_pitch: if three_d { d.depth } else { 1 },
+                    offset,
+                    tail: None,
+                });
+            }
             offset += u64::from(pitch) * u64::from(h) * bpe;
         }
         mips.reverse();
@@ -326,17 +346,22 @@ impl Layout {
         }
     }
 
-    fn tiled(d: Desc, block_log2: u32) -> Layout {
+    fn tiled(d: Desc, block_log2: u32, full: bool) -> Layout {
         let element_log2 = d.element_bytes.trailing_zeros();
         let bpe = u64::from(d.element_bytes);
         let block_bytes = 1u64 << block_log2;
-        let thick = d.dimension == Dimension::Tex3d && (d.swizzle.standard() || d.swizzle.display());
+        let thick =
+            d.dimension == Dimension::Tex3d && (d.swizzle.standard() || d.swizzle.display());
         let block = if thick {
             // ComputeThickBlockDimension
             let amp = (block_log2 - 10) / 3;
             let rest = (block_log2 - 10) % 3;
             let b = BLOCK_1K_3D[element_log2 as usize];
-            [b[0] << amp, b[1] << (amp + rest / 2), b[2] << (amp + u32::from(rest != 0))]
+            [
+                b[0] << amp,
+                b[1] << (amp + rest / 2),
+                b[2] << (amp + u32::from(rest != 0)),
+            ]
         } else {
             // ComputeThinBlockDimension
             let samples_log2 = d.samples.trailing_zeros();
@@ -352,12 +377,21 @@ impl Layout {
         let mip_depth = |i: u32| if thick { padded_dim(d.depth, i, 1) } else { 1 };
         let depth_of = |i: u32| if three_d { dim(d.depth, i, 1) } else { 1 };
         let (width, height) = (|i| dim(d.width, i, d.block), |i| dim(d.height, i, d.block));
-        let padded = |i| (padded_dim(d.width, i, d.block), padded_dim(d.height, i, d.block));
-        let mut mips = Vec::with_capacity(d.mips as usize);
+        let padded = |i| {
+            (
+                padded_dim(d.width, i, d.block),
+                padded_dim(d.height, i, d.block),
+            )
+        };
+        let mut mips = if full {
+            Vec::with_capacity(d.mips as usize)
+        } else {
+            Vec::new()
+        };
         let mut first_tail_mip = d.mips;
         let mut slice_size = 0u64;
         if d.mips == 1 {
-            mips.push(Mip {
+            let mip = Mip {
                 width: width(0),
                 height: height(0),
                 depth: depth_of(0),
@@ -366,11 +400,11 @@ impl Layout {
                 depth_pitch: if three_d { slices } else { 1 },
                 offset: 0,
                 tail: None,
-            });
-            slice_size = u64::from(mips[0].pitch)
-                * u64::from(mips[0].rows)
-                * bpe
-                * u64::from(d.samples);
+            };
+            slice_size = u64::from(mip.pitch) * u64::from(mip.rows) * bpe * u64::from(d.samples);
+            if full {
+                mips.push(mip);
+            }
         } else {
             // GetMipTailDim: the largest mip the tail takes.
             let mut tail_max = block;
@@ -415,68 +449,73 @@ impl Layout {
                 let depth = mip_depth(i).next_multiple_of(block[2]);
                 let one = u64::from(pitch) * u64::from(rows) * bpe;
                 slice_size += one;
-                sizes.push(one * u64::from(block[2]));
-                mips.push(Mip {
-                    width: width(i),
-                    height: height(i),
-                    depth: depth_of(i),
-                    pitch,
-                    rows,
-                    depth_pitch: if three_d { depth } else { 1 },
-                    offset: 0,
-                    tail: None,
-                });
-            }
-            // Standard mips from the smallest up, after the tail block.
-            let mut offset = if first_tail_mip < d.mips {
-                block_bytes
-            } else {
-                0
-            };
-            for i in (0..first_tail_mip as usize).rev() {
-                mips[i].offset = offset;
-                offset += sizes[i];
-            }
-            let micro = if thick {
-                let b = BLOCK_256_3D[element_log2 as usize];
-                [b[0], b[1]]
-            } else {
-                BLOCK_256_2D[element_log2 as usize]
-            };
-            let (mut pitch, mut rows) = (tail_max[0], tail_max[1]);
-            for i in first_tail_mip..d.mips {
-                let m = max_in_tail - 1 - (i - first_tail_mip);
-                let offset = if m > 6 { 16 << m } else { m << 8 };
-                // Address bits 8.. of the offset, odd ones x, even ones y.
-                let bits = |from: u32| (0..6).map(|b| ((offset >> (from + 2 * b)) & 1) << b).sum();
-                let (mut x, mut y): (u32, u32) = (bits(9), bits(8));
-                if block_log2 & 1 != 0 {
-                    std::mem::swap(&mut x, &mut y);
-                    if element_log2 & 1 != 0 {
-                        y = (y << 1) | (x & 1);
-                        x >>= 1;
-                    }
+                if full {
+                    sizes.push(one * u64::from(block[2]));
+                    mips.push(Mip {
+                        width: width(i),
+                        height: height(i),
+                        depth: depth_of(i),
+                        pitch,
+                        rows,
+                        depth_pitch: if three_d { depth } else { 1 },
+                        offset: 0,
+                        tail: None,
+                    });
                 }
-                mips.push(Mip {
-                    width: width(i),
-                    height: height(i),
-                    depth: depth_of(i),
-                    pitch,
-                    rows,
-                    depth_pitch: if thick {
-                        mip_depth(i).next_multiple_of(BLOCK_256_3D[element_log2 as usize][2])
-                    } else {
-                        1
-                    },
-                    offset: 0,
-                    tail: Some(Tail {
-                        offset,
-                        x: x * micro[0],
-                        y: y * micro[1],
-                    }),
-                });
-                pitch = (pitch >> 1).max(micro[0]);
-                rows = (rows >> 1).max(micro[1]);
+            }
+            if full {
+                // Standard mips from the smallest up, after the tail block.
+                let mut offset = if first_tail_mip < d.mips {
+                    block_bytes
+                } else {
+                    0
+                };
+                for i in (0..first_tail_mip as usize).rev() {
+                    mips[i].offset = offset;
+                    offset += sizes[i];
+                }
+                let micro = if thick {
+                    let b = BLOCK_256_3D[element_log2 as usize];
+                    [b[0], b[1]]
+                } else {
+                    BLOCK_256_2D[element_log2 as usize]
+                };
+                let (mut pitch, mut rows) = (tail_max[0], tail_max[1]);
+                for i in first_tail_mip..d.mips {
+                    let m = max_in_tail - 1 - (i - first_tail_mip);
+                    let offset = if m > 6 { 16 << m } else { m << 8 };
+                    // Address bits 8.. of the offset, odd ones x, even ones y.
+                    let bits =
+                        |from: u32| (0..6).map(|b| ((offset >> (from + 2 * b)) & 1) << b).sum();
+                    let (mut x, mut y): (u32, u32) = (bits(9), bits(8));
+                    if block_log2 & 1 != 0 {
+                        std::mem::swap(&mut x, &mut y);
+                        if element_log2 & 1 != 0 {
+                            y = (y << 1) | (x & 1);
+                            x >>= 1;
+                        }
+                    }
+                    mips.push(Mip {
+                        width: width(i),
+                        height: height(i),
+                        depth: depth_of(i),
+                        pitch,
+                        rows,
+                        depth_pitch: if thick {
+                            mip_depth(i).next_multiple_of(BLOCK_256_3D[element_log2 as usize][2])
+                        } else {
+                            1
+                        },
+                        offset: 0,
+                        tail: Some(Tail {
+                            offset,
+                            x: x * micro[0],
+                            y: y * micro[1],
+                        }),
+                    });
+                    pitch = (pitch >> 1).max(micro[0]);
+                    rows = (rows >> 1).max(micro[1]);
+                }
             }
         }
         // Thick layouts store each depth slab's chain together.
@@ -484,7 +523,7 @@ impl Layout {
         let slice_size = slice_size * slab;
         let slices = slices / block[2];
         let addressable = !d.swizzle.xor() && d.samples == 1;
-        let pattern = if addressable {
+        let pattern = if full && addressable {
             let kind = if thick {
                 2
             } else {
@@ -564,7 +603,8 @@ impl Layout {
         // offset inside the tail block.
         let y = y + m.tail.map_or(0, |t| t.y);
         let blocks = u64::from(y / bh) * u64::from(m.pitch / bw);
-        (blocks << log2) + u64::from(self.pattern[1][(y % bh) as usize] | self.pattern[2][z as usize])
+        (blocks << log2)
+            + u64::from(self.pattern[1][(y % bh) as usize] | self.pattern[2][z as usize])
     }
 
     /// The part of an address that depends on the column.
@@ -594,9 +634,17 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
-        })
+        self.walk(
+            tiled.len(),
+            mip,
+            slice,
+            linear.len(),
+            row_pitch,
+            depth_pitch,
+            |t, l, len| {
+                linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+            },
+        )
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -609,9 +657,17 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
-        })
+        self.walk(
+            tiled.len(),
+            mip,
+            slice,
+            linear.len(),
+            row_pitch,
+            depth_pitch,
+            |t, l, len| {
+                tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
+            },
+        )
     }
 
     pub fn decode_bc3(
@@ -865,7 +921,7 @@ pub struct Texture {
 }
 
 impl Texture {
-    pub fn new(desc: &TextureDesc) -> Result<Texture, Error> {
+    fn plane_desc(desc: &TextureDesc) -> Result<(Desc, bool), Error> {
         let f = format(desc.format).ok_or(Error::Invalid)?;
         let depth3d = if desc.dimension == Dimension::Tex3d {
             desc.depth_or_array
@@ -873,27 +929,58 @@ impl Texture {
             1
         };
         let mips = match desc.mips {
-            0 => 32 - desc.width.max(desc.height).max(depth3d).max(1).leading_zeros(),
+            0 => {
+                32 - desc
+                    .width
+                    .max(desc.height)
+                    .max(depth3d)
+                    .max(1)
+                    .leading_zeros()
+            }
             n => n,
         };
-        let plane = |bytes| Desc {
-            dimension: desc.dimension,
-            width: desc.width,
-            height: desc.height,
-            depth: desc.depth_or_array,
-            mips,
-            element_bytes: bytes,
-            block: f.block,
-            samples: desc.samples.max(1),
-            swizzle: desc.swizzle,
-        };
+        Ok((
+            Desc {
+                dimension: desc.dimension,
+                width: desc.width,
+                height: desc.height,
+                depth: desc.depth_or_array,
+                mips,
+                element_bytes: f.bytes,
+                block: f.block,
+                samples: desc.samples.max(1),
+                swizzle: desc.swizzle,
+            },
+            f.stencil,
+        ))
+    }
+
+    pub fn allocation(desc: &TextureDesc) -> Result<Allocation, Error> {
+        let (plane, stencil) = Self::plane_desc(desc)?;
+        let mut allocation = Layout::allocation(&plane)?;
+        if stencil {
+            let second = Layout::allocation(&Desc {
+                element_bytes: 1,
+                ..plane
+            })?;
+            allocation.size = allocation.size.next_multiple_of(second.alignment) + second.size;
+            allocation.alignment = allocation.alignment.max(second.alignment);
+        }
+        Ok(allocation)
+    }
+
+    pub fn new(desc: &TextureDesc) -> Result<Texture, Error> {
+        let (plane, stencil) = Self::plane_desc(desc)?;
         let mut planes = vec![Plane {
             offset: 0,
             stencil: false,
-            layout: Layout::new(&plane(f.bytes))?,
+            layout: Layout::new(&plane)?,
         }];
-        if f.stencil {
-            let layout = Layout::new(&plane(1))?;
+        if stencil {
+            let layout = Layout::new(&Desc {
+                element_bytes: 1,
+                ..plane
+            })?;
             let offset = planes[0].layout.size.next_multiple_of(layout.alignment);
             planes.push(Plane {
                 offset,
@@ -916,6 +1003,121 @@ impl Texture {
 mod tests {
     use super::*;
 
+    #[test]
+    fn allocation_queries_match_full_layouts_across_formats_and_tile_modes() {
+        for dimension in [Dimension::Tex1d, Dimension::Tex2d, Dimension::Tex3d] {
+            for (width, height, depth) in
+                [(1, 1, 1), (33, 17, 3), (3193, 1579, 2), (16384, 16384, 1)]
+            {
+                for format in [
+                    1, 5, 9, 20, 28, 45, 55, 60, 71, 77, 80, 83, 98, 116, 118, 120, 190,
+                ] {
+                    for swizzle in [0, 1, 2, 5, 6, 9, 10, 17, 18, 21, 22, 23, 24, 25, 26, 27] {
+                        for mips in [0, 1, 5] {
+                            for samples in [0, 1, 2, 4, 8] {
+                                let d = TextureDesc {
+                                    dimension,
+                                    width,
+                                    height: if dimension == Dimension::Tex1d {
+                                        1
+                                    } else {
+                                        height
+                                    },
+                                    depth_or_array: depth,
+                                    mips,
+                                    format,
+                                    samples,
+                                    swizzle: Swizzle(swizzle),
+                                };
+                                let reference = Texture::new(&d).map(|layout| Allocation {
+                                    size: layout.size,
+                                    alignment: layout.alignment,
+                                });
+                                assert_eq!(Texture::allocation(&d), reference, "{d:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn allocation_queries_reject_the_same_invalid_descriptions() {
+        let base = TextureDesc {
+            dimension: Dimension::Tex2d,
+            width: 64,
+            height: 33,
+            depth_or_array: 1,
+            mips: 1,
+            format: 28,
+            samples: 1,
+            swizzle: Swizzle::SW_4KB_S,
+        };
+        for d in [
+            TextureDesc { width: 0, ..base },
+            TextureDesc { height: 0, ..base },
+            TextureDesc {
+                depth_or_array: 0,
+                ..base
+            },
+            TextureDesc {
+                width: MAX_EXTENT + 1,
+                ..base
+            },
+            TextureDesc {
+                mips: MAX_MIPS + 1,
+                ..base
+            },
+            TextureDesc { samples: 3, ..base },
+            TextureDesc { format: 0, ..base },
+            TextureDesc {
+                swizzle: Swizzle(3),
+                ..base
+            },
+        ] {
+            assert_eq!(Texture::new(&d), Err(Error::Invalid), "{d:?}");
+            assert_eq!(Texture::allocation(&d), Err(Error::Invalid), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn allocation_metadata_never_materializes_mips_or_swizzle_tables() {
+        let mut largest_pattern = 0;
+        for swizzle in [
+            Swizzle::LINEAR,
+            Swizzle::SW_256B_S,
+            Swizzle::SW_4KB_S,
+            Swizzle::SW_64KB_D,
+            Swizzle::SW_64KB_Z_X,
+        ] {
+            for bytes in [1, 2, 4, 8, 16] {
+                for mips in [1, 16] {
+                    let d = desc(16384, 16384, mips, bytes, swizzle);
+                    let metadata = Layout::build(&d, false).unwrap();
+                    let full = Layout::new(&d).unwrap();
+                    assert_eq!(
+                        (metadata.size, metadata.alignment),
+                        (full.size, full.alignment)
+                    );
+                    assert_eq!(metadata.mips.capacity(), 0);
+                    assert!(metadata.pattern.iter().all(|axis| axis.capacity() == 0));
+                    let pattern = full
+                        .pattern
+                        .iter()
+                        .map(|axis| axis.len() * size_of::<u32>())
+                        .sum::<usize>();
+                    largest_pattern = largest_pattern.max(pattern);
+                }
+            }
+        }
+        assert_eq!(largest_pattern, 2052);
+        println!(
+            "Mip={} bytes; maximum block-axis offsets={} bytes per plane",
+            size_of::<Mip>(),
+            largest_pattern
+        );
+    }
     fn desc(w: u32, h: u32, mips: u32, bpe: u32, swizzle: Swizzle) -> Desc {
         Desc {
             dimension: Dimension::Tex2d,
@@ -1005,7 +1207,11 @@ mod tests {
             let mut seen = vec![false; l.size as usize];
             let mut tiled = vec![0u8; l.size as usize];
             let n = d.element_bytes as usize;
-            let slices = if d.dimension == Dimension::Tex3d { 1 } else { d.depth };
+            let slices = if d.dimension == Dimension::Tex3d {
+                1
+            } else {
+                d.depth
+            };
             for slice in 0..slices {
                 for mip in 0..d.mips {
                     let m = l.mips[mip as usize];
@@ -1034,7 +1240,11 @@ mod tests {
                                 seen[at] = true;
                             }
                         }
-                        assert!(back[base + plane - 11..base + plane].iter().all(|&b| b == 0xcc));
+                        assert!(
+                            back[base + plane - 11..base + plane]
+                                .iter()
+                                .all(|&b| b == 0xcc)
+                        );
                     }
                 }
             }

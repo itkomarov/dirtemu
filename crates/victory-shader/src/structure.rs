@@ -901,6 +901,15 @@ impl<'a> Lanes<'a> {
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
         }
+        if self.p.wave64 {
+            let source = (self.move_source(k.0), self.move_source(k.1));
+            if source != k
+                && let Some(&m) = self.masks.get(&source)
+            {
+                self.masks.insert(k, m);
+                return (m, true);
+            }
+        }
         let p = self.p;
         let (m, derived) = match self.join(k) {
             Some(join) => join,
@@ -941,6 +950,20 @@ impl<'a> Lanes<'a> {
         };
         cache.insert(k, m);
         (m, derived)
+    }
+
+    fn move_source(&self, mut value: Value) -> Value {
+        while let Some(&(b, i)) = self.defs.get(&value) {
+            let inst = &self.p.blocks[b].insts[i];
+            let [(Reg::S(_), source)] = inst.reads.as_slice() else {
+                break;
+            };
+            if inst.name() != "s_mov_b32" {
+                break;
+            }
+            value = *source;
+        }
+        value
     }
 
     /// A mask joined by phis at a block entry, and whether a mask coming in
@@ -1668,6 +1691,32 @@ mod tests {
         };
         assert!(matches!(s.bools.support(when)[..], [Atom::Uniform(_)]));
         assert_eq!(guarded(&s), 0);
+    }
+
+    #[test]
+    fn a_wave64_mask_restored_through_scalar_moves_keeps_both_halves() {
+        for (high, intact) in [(0xBE83_036B, true), (0xBE83_036A, false)] {
+            let p = build(
+                &[
+                    0x7D84_0080,
+                    0xBE84_046A,
+                    0xBF06_0100,
+                    0xBF85_0004,
+                    0xBE82_036A,
+                    high,
+                    0xBE84_0302,
+                    0xBE85_0303,
+                    0xBEFE_0404,
+                    0x7E02_0280,
+                    S_ENDPGM,
+                ],
+                true,
+            );
+            let s = structure(&p).unwrap();
+            let compare = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+            let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
+            assert_eq!(s.masks[&restored] == s.masks[&compare], intact);
+        }
     }
 
     #[test]

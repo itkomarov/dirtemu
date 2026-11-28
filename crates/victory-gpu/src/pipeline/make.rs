@@ -34,6 +34,8 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    #[cfg(test)]
+    waits: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -67,6 +69,8 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            #[cfg(test)]
+            waits: AtomicU64::new(0),
         }
     }
 
@@ -279,6 +283,8 @@ fn wait(p: &Pending) {
     if left.is_zero() {
         return;
     }
+    #[cfg(test)]
+    p.waits.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -623,18 +629,27 @@ mod tests {
         if budget.is_zero() || budget > Duration::from_secs(2) {
             return;
         }
-        let pending = Pending::new(Vec::new(), None);
-        let shown = crate::queue::presented();
-        wait(&pending);
-        let null = std::ptr::null();
-        crate::frame::set_interval(null, null, 1000, 1, 0);
-        let mut token = 0;
-        crate::frame::wait(null, 0, 2, std::ptr::null(), 2, &mut token);
-        crate::frame::wait(null, 0, 2, std::ptr::null(), 2, &mut token);
-        assert_eq!(crate::queue::presented(), shown);
-        let started = Instant::now();
-        wait(&pending);
-        assert!(started.elapsed() < budget / 2);
+        for _ in 0..8 {
+            let pending = Pending::new(Vec::new(), None);
+            let shown = crate::queue::presented();
+            wait(&pending);
+            let waits = pending.waits.load(Ordering::Relaxed);
+            let null = std::ptr::null();
+            crate::frame::set_interval(null, null, 1000, 1, 0);
+            let mut token = 0;
+            crate::frame::wait(null, 0, 2, std::ptr::null(), 2, &mut token);
+            crate::frame::wait(null, 0, 2, std::ptr::null(), 2, &mut token);
+            if crate::queue::presented() != shown {
+                continue;
+            }
+            wait(&pending);
+            if crate::queue::presented() != shown {
+                continue;
+            }
+            assert_eq!(pending.waits.load(Ordering::Relaxed), waits);
+            return;
+        }
+        panic!("other tests presented frames during every pacing check");
     }
 
     /// A first use queues the pipeline and, within the budget, gets the

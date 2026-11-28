@@ -802,6 +802,30 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Draw,
     ) -> Result<Vec<[f32; 4]>, String> {
+        self.draw_vertices(root, pso, d, 3)
+    }
+
+    pub fn draw_vertices(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Draw,
+        vertex_count: u32,
+    ) -> Result<Vec<[f32; 4]>, String> {
+        if vertex_count == 0 {
+            return Err("zero vertices in a draw".into());
+        }
+        if d.mesh_groups == 0 && !d.vertices.is_empty() {
+            let bytes = d
+                .vertices
+                .len()
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or("vertex buffer size overflow")?;
+            let needed = u64::from(vertex_count) * u64::from(d.stride);
+            if d.stride == 0 || needed > bytes as u64 {
+                return Err("draw vertices exceed the provided vertex buffer".into());
+            }
+        }
         let dev = &self.device;
         let (w, h) = d.size;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -1046,7 +1070,7 @@ impl Host {
                 let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
                 list6.DispatchMesh(d.mesh_groups, 1, 1);
             } else {
-                list.DrawInstanced(3, 1, 0, 0);
+                list.DrawInstanced(vertex_count, 1, 0, 0);
             }
             list.ResourceBarrier(&[transition(
                 &target,

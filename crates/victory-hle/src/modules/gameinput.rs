@@ -818,7 +818,10 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
             return true;
         }
         state = match deadline {
-            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
+            None => hub
+                .returned
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner),
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     return false;
@@ -1144,28 +1147,21 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
+
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
             if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
-                    }
-                }
+                scripted_pad(&mut pad, &scripted());
             }
             Some(pad)
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
             let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
+
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1198,30 +1194,126 @@ mod host {
         }
     }
 
+    fn scripted_pad(pad: &mut PadState, keys: &[u8]) {
+        for vk in keys {
+            if let Some(&(_, button)) = FALLBACK_BUTTONS.iter().find(|(key, _)| key == vk) {
+                pad.buttons |= button;
+            }
+        }
+    }
+
+    fn scripted_key(key: &str) -> Option<u8> {
+        Some(match key.trim().to_ascii_lowercase().as_str() {
+            "enter" => 0x0D,
+            "esc" => 0x1B,
+            "tab" => 0x09,
+            "back" | "backspace" => 0x08,
+            "up" => 0x26,
+            "down" => 0x28,
+            "left" => 0x25,
+            "right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        })
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct InputCommand {
+        id: u64,
+        key: u8,
+        hold: Duration,
+    }
+
+    impl InputCommand {
+        fn parse(text: &str) -> Option<Self> {
+            let mut words = text.split_whitespace();
+            let id = words.next()?.parse().ok()?;
+            let key = scripted_key(words.next()?)?;
+            let millis = words.next()?.parse::<u64>().ok()?;
+            if words.next().is_some() || !(1..=2000).contains(&millis) {
+                return None;
+            }
+            Some(Self {
+                id,
+                key,
+                hold: Duration::from_millis(millis),
+            })
+        }
+
+        fn read(path: &std::path::Path) -> std::io::Result<Self> {
+            use std::io::Read;
+            let mut bytes = Vec::with_capacity(257);
+            std::fs::File::open(path)?
+                .take(257)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 256 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "input command exceeds 256 bytes",
+                ));
+            }
+            std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(Self::parse)
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid input command")
+                })
+        }
+    }
+
+    #[derive(Default)]
+    struct InputCommands {
+        last_id: Option<u64>,
+        active: Option<(u8, Instant)>,
+        poll_after: Option<Instant>,
+        error: Option<std::io::ErrorKind>,
+    }
+
+    impl InputCommands {
+        fn key(&mut self, path: &std::path::Path, now: Instant) -> Option<u8> {
+            if self.active.is_some_and(|(_, until)| now >= until) {
+                self.active = None;
+            }
+            if self.poll_after.is_none_or(|after| now >= after) {
+                self.poll_after = Some(now + Duration::from_millis(50));
+                match InputCommand::read(path) {
+                    Ok(command) => {
+                        self.error = None;
+                        if self.last_id.is_none_or(|last| command.id > last) {
+                            self.last_id = Some(command.id);
+                            self.active = Some((command.key, now + command.hold));
+                            tracing::info!(
+                                id = command.id,
+                                key = command.key,
+                                millis = command.hold.as_millis(),
+                                "GameInput test command accepted"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        self.active = None;
+                        if self.error != Some(error.kind()) {
+                            tracing::debug!(%error, "GameInput test command unavailable; test input released");
+                            self.error = Some(error.kind());
+                        }
+                    }
+                }
+            }
+            self.active.map(|(key, _)| key)
+        }
+    }
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
     /// 0.2 s that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
+                let vk = scripted_key(key)?;
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
                     vk,
@@ -1231,12 +1323,247 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
-            .collect()
+            .collect();
+        static FILE: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| {
+            std::env::var_os("VICTORY_INPUT_COMMANDS")
+                .filter(|path| !path.is_empty())
+                .map(Into::into)
+        });
+        static COMMANDS: LazyLock<Mutex<InputCommands>> =
+            LazyLock::new(|| Mutex::new(InputCommands::default()));
+        if let Some(path) = FILE.as_ref()
+            && let Some(key) = lock(&COMMANDS).key(path, Instant::now())
+            && !down.contains(&key)
+        {
+            down.push(key);
+        }
+        down
     }
 
+    #[cfg(test)]
+    mod command_tests {
+        use super::*;
+
+        fn keys(
+            commands: &mut InputCommands,
+            path: &std::path::Path,
+            at: Instant,
+        ) -> Vec<KeyState> {
+            commands
+                .key(path, at)
+                .map(|virtual_key| KeyState {
+                    virtual_key,
+                    ..Default::default()
+                })
+                .into_iter()
+                .collect()
+        }
+
+        fn fallback_buttons(state: &State) -> u32 {
+            match state.slots[FALLBACK].history.back().unwrap().value {
+                Value::Pad(pad) => pad.buttons,
+                Value::Keys(_) => unreachable!(),
+            }
+        }
+
+        #[test]
+        fn input_command_drives_fallback_a_down_and_up_without_host_focus() {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), "1 Enter 300").unwrap();
+            let mut commands = InputCommands::default();
+            let start = Instant::now();
+            let devices = std::array::from_fn(Device::new);
+            let mut state = State {
+                slots: Default::default(),
+                callbacks: Vec::new(),
+                pending: Vec::new(),
+                running: Vec::new(),
+            };
+            state.poll(
+                &devices,
+                [None; PADS],
+                keys(&mut commands, file.path(), start),
+            );
+            assert_eq!(fallback_buttons(&state), A);
+            assert_eq!(state.slots[FALLBACK].sequence, 1);
+            state.poll(
+                &devices,
+                [None; PADS],
+                keys(
+                    &mut commands,
+                    file.path(),
+                    start + Duration::from_millis(299),
+                ),
+            );
+            assert_eq!(fallback_buttons(&state), A);
+            assert_eq!(state.slots[FALLBACK].sequence, 1);
+            state.poll(
+                &devices,
+                [None; PADS],
+                keys(
+                    &mut commands,
+                    file.path(),
+                    start + Duration::from_millis(300),
+                ),
+            );
+            assert_eq!(fallback_buttons(&state), 0);
+            assert_eq!(state.slots[FALLBACK].sequence, 2);
+            assert!(
+                matches!(&state.slots[KEYBOARD].history.back().unwrap().value, Value::Keys(keys) if keys.is_empty())
+            );
+        }
+
+        #[test]
+        fn repeated_or_older_input_ids_do_not_extend_or_restart_a_press() {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), "7 Enter 100").unwrap();
+            let mut commands = InputCommands::default();
+            let start = Instant::now();
+            assert_eq!(commands.key(file.path(), start), Some(0x0D));
+            assert_eq!(
+                commands.key(file.path(), start + Duration::from_millis(50)),
+                Some(0x0D)
+            );
+            assert_eq!(
+                commands.key(file.path(), start + Duration::from_millis(100)),
+                None
+            );
+            std::fs::write(file.path(), "7 Enter 2000").unwrap();
+            assert_eq!(
+                commands.key(file.path(), start + Duration::from_millis(150)),
+                None
+            );
+            std::fs::write(file.path(), "6 Back 2000").unwrap();
+            assert_eq!(
+                commands.key(file.path(), start + Duration::from_millis(200)),
+                None
+            );
+            std::fs::write(file.path(), "8 Back 50").unwrap();
+            assert_eq!(
+                commands.key(file.path(), start + Duration::from_millis(250)),
+                Some(0x08)
+            );
+            assert_eq!(
+                commands.key(file.path(), start + Duration::from_millis(300)),
+                None
+            );
+            assert_eq!(commands.last_id, Some(8));
+        }
+
+        #[test]
+        fn command_polling_is_bounded_and_expiry_does_not_wait_for_file_poll() {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), "1 Enter 1").unwrap();
+            let mut commands = InputCommands::default();
+            let start = Instant::now();
+            assert_eq!(commands.key(file.path(), start), Some(0x0D));
+            std::fs::write(file.path(), "2 Back 300").unwrap();
+            assert_eq!(
+                commands.key(file.path(), start + Duration::from_millis(1)),
+                None
+            );
+            assert_eq!(
+                commands.key(file.path(), start + Duration::from_millis(49)),
+                None
+            );
+            assert_eq!(commands.last_id, Some(1));
+            assert_eq!(
+                commands.key(file.path(), start + Duration::from_millis(50)),
+                Some(0x08)
+            );
+            assert_eq!(commands.last_id, Some(2));
+        }
+
+        #[test]
+        fn invalid_or_oversized_commands_release_input_and_duration_limits_are_checked() {
+            for text in [
+                "",
+                "1 Enter",
+                "1 Unknown 50",
+                "1 Enter 0",
+                "1 Enter 2001",
+                "1 Enter -1",
+                "1 Enter 18446744073709551615",
+                "-1 Enter 30",
+                "1 Enter 50 extra",
+                "1 Enter 1.5",
+            ] {
+                assert!(InputCommand::parse(text).is_none(), "accepted {text:?}");
+            }
+            for (text, millis) in [("0 Enter 1", 1), ("18446744073709551615 Enter 2000", 2000)] {
+                assert_eq!(
+                    InputCommand::parse(text).unwrap().hold,
+                    Duration::from_millis(millis)
+                );
+            }
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let start = Instant::now();
+            for bad in [b"2 Enter 0".to_vec(), vec![b' '; 257], vec![0xff; 12]] {
+                let mut commands = InputCommands::default();
+                std::fs::write(file.path(), "1 Enter 2000").unwrap();
+                assert_eq!(commands.key(file.path(), start), Some(0x0D));
+                std::fs::write(file.path(), bad).unwrap();
+                assert_eq!(
+                    commands.key(file.path(), start + Duration::from_millis(50)),
+                    None
+                );
+                assert_eq!(commands.last_id, Some(1));
+            }
+        }
+
+        #[test]
+        fn missing_command_file_releases_input_without_forgetting_the_last_id() {
+            let folder = tempfile::tempdir().unwrap();
+            let path = folder.path().join("commands.txt");
+            let mut commands = InputCommands::default();
+            let start = Instant::now();
+            assert_eq!(commands.key(&path, start), None);
+            std::fs::write(&path, "1 Enter 2000").unwrap();
+            assert_eq!(
+                commands.key(&path, start + Duration::from_millis(50)),
+                Some(0x0D)
+            );
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(
+                commands.key(&path, start + Duration::from_millis(100)),
+                None
+            );
+            std::fs::write(&path, "1 Enter 2000").unwrap();
+            assert_eq!(
+                commands.key(&path, start + Duration::from_millis(150)),
+                None
+            );
+        }
+
+        #[test]
+        fn scripted_input_merges_into_a_real_pad_and_releases_its_own_button() {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), "1 Enter 100").unwrap();
+            let mut commands = InputCommands::default();
+            let start = Instant::now();
+            let real = PadState {
+                buttons: B,
+                left_x: 0.5,
+                ..Default::default()
+            };
+            let mut pressed = real;
+            let down: Vec<u8> = commands.key(file.path(), start).into_iter().collect();
+            scripted_pad(&mut pressed, &down);
+            assert_eq!(pressed.buttons, A | B);
+            assert_eq!(pressed.left_x, real.left_x);
+            let mut released = real;
+            let up: Vec<u8> = commands
+                .key(file.path(), start + Duration::from_millis(100))
+                .into_iter()
+                .collect();
+            scripted_pad(&mut released, &up);
+            assert_eq!(released, real);
+        }
+    }
     /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {
         let mut process = 0;
@@ -1578,7 +1905,16 @@ mod tests {
         let mut token = 0;
         let context = (&raw const hub.object).cast_mut().cast();
         assert_eq!(
-            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
+            register(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                1,
+                0,
+                context,
+                Some(slow),
+                &mut token
+            ),
             S_OK
         );
         host.lock().unwrap().pads[1] = Some(PadState::default());
@@ -1587,7 +1923,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
+        assert!(
+            !unregister(&hub.object, token, 5000),
+            "times out while it runs"
+        );
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
             LEAVE.store(true, Ordering::SeqCst);

@@ -361,6 +361,54 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
     shapes: Vec::new(),
     shape_index: std::collections::BTreeMap::new(),
 });
+
+#[cfg(windows)]
+static RELEASE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+pub(crate) fn release_epoch() -> u64 {
+    RELEASE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(windows)]
+pub(crate) fn is_object_record(record: &[u32; 3]) -> bool {
+    record[0] == VIEW_TAG && record[2] >> KIND_SHIFT == 0
+}
+
+#[cfg(windows)]
+fn expired_in(views: &Views, record: &[u32; 3]) -> bool {
+    views
+        .list
+        .get(record[1] as usize)
+        .is_none_or(|(_, generation)| *generation != record[2])
+}
+
+#[cfg(windows)]
+pub(crate) fn expired_object_views(records: &[(u32, [u32; 3])]) -> Vec<(u32, u64)> {
+    let count = records
+        .iter()
+        .filter(|(_, record)| is_object_record(record))
+        .count();
+    let mut expired = Vec::with_capacity(count);
+    if count == 0 {
+        return expired;
+    }
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(index, record) in records {
+        if is_object_record(&record) && expired_in(&views, &record) {
+            expired.push((index, u64::from(record[2]) << 32 | u64::from(record[1])));
+        }
+    }
+    expired
+}
+
+#[cfg(windows)]
+pub(crate) fn object_view_expired(record: &[u32; 3]) -> bool {
+    if !is_object_record(record) {
+        return false;
+    }
+    expired_in(&VIEWS.lock().unwrap_or_else(|e| e.into_inner()), record)
+}
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 /// A record is the tag and two words, `i` and `generation` (the host keeps
@@ -710,6 +758,7 @@ pub(crate) fn forget(resource: usize) {
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    let mut expired = false;
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -723,7 +772,15 @@ pub(crate) fn forget(resource: usize) {
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+        expired = true;
     }
+    drop(views);
+    #[cfg(windows)]
+    if expired {
+        RELEASE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+    #[cfg(not(windows))]
+    let _ = expired;
 }
 
 /// The view the record words `i` and `generation` name: the one they hold

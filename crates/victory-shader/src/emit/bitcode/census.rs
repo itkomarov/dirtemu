@@ -151,7 +151,7 @@ impl Module {
                     Op::Cast(Cast::Bitcast, _) => k("bitcast"),
                     Op::Cast(..) => k("cast"),
                     Op::Select(..) => k("select"),
-                    Op::Extract(..) => k("extract"),
+                    Op::Extract(..) | Op::Insert(..) => k("extract"),
                     Op::Phi(_) => k("phi"),
                     Op::Gep(..) => k("gep"),
                     Op::Load(_) => k("lds_load"),

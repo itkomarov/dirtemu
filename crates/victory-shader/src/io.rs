@@ -369,6 +369,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         defs: &defs,
         phis: &phis,
     };
+    let mut first_halves = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -382,7 +383,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => {}
+                        ("v_interp_p1_f32", _) => first_halves.push((site, attribute)),
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
@@ -402,7 +403,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
-                    "v_interp_p1ll_f16" => {}
+                    "v_interp_p1ll_f16" => {
+                        first_halves.push((site, attribute(inst, &v.src[0])?));
+                    }
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
                         let read = |k: usize| match v.src.get(k) {
@@ -458,6 +461,49 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 }
                 _ => {}
             }
+        }
+    }
+    if first_halves.is_empty() {
+        return Ok(io);
+    }
+    let folded: std::collections::HashSet<_> = io
+        .interps
+        .iter()
+        .filter_map(|(site, interp)| matches!(interp, Interp::Interpolated { .. }).then_some(*site))
+        .collect();
+    let mut used: std::collections::HashSet<_> = p
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(b, block)| {
+            block
+                .insts
+                .iter()
+                .enumerate()
+                .map(move |(i, inst)| ((b, i), inst))
+        })
+        .filter(|(site, _)| !folded.contains(site))
+        .flat_map(|(_, inst)| inst.reads.iter().map(|read| read.1))
+        .collect();
+    loop {
+        let before = used.len();
+        for phi in p.blocks.iter().flat_map(|block| &block.phis) {
+            if used.contains(&phi.value) {
+                used.extend(&phi.args);
+            }
+        }
+        if used.len() == before {
+            break;
+        }
+    }
+    for (site, attribute) in first_halves {
+        if !io.interps.iter().any(|(mapped, _)| *mapped == site)
+            && p.blocks[site.0].insts[site.1]
+                .writes
+                .iter()
+                .any(|write| used.contains(&write.1))
+        {
+            io.interps.push((site, Interp::Weighted { attribute }));
         }
     }
     Ok(io)
@@ -723,6 +769,79 @@ mod tests {
                 ((0, 2), Interp::Weighted { attribute }),
             ]
         );
+    }
+
+    #[test]
+    fn first_half_standalone_keeps_its_partial_value() {
+        let p = program(&[0xC808_0000, 0xF800_180F, 0x0202_0202, S_ENDPGM]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert!(matches!(
+            &io.interps[..],
+            [((0, 0), Interp::Weighted { .. })]
+        ));
+    }
+
+    #[test]
+    fn first_half_read_beside_a_pair_keeps_the_partial_and_complete_values() {
+        let p = program(&[
+            0xC808_0000,
+            0x7E06_0302,
+            0xC809_0001,
+            0x0604_0702,
+            0xF800_180F,
+            0x0202_0202,
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert_eq!(io.interps.len(), 2);
+        assert!(
+            io.interps
+                .iter()
+                .any(|(site, interp)| *site == (0, 0) && matches!(interp, Interp::Weighted { .. }))
+        );
+        assert!(io.interps.iter().any(|(site, interp)| *site == (0, 2)
+            && matches!(interp, Interp::Interpolated { first, .. } if first == &[(0, 0)])));
+    }
+
+    #[test]
+    fn first_halves_read_through_a_phi_keep_their_partial_values() {
+        let p = program(&[
+            0xBF06_8000,
+            0xBF85_0002,
+            0xC808_0000,
+            0xBF82_0001,
+            0xC808_0000,
+            0xF800_180F,
+            0x0202_0202,
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert_eq!(io.interps.len(), 2);
+        assert!(
+            io.interps
+                .iter()
+                .all(|(_, interp)| matches!(interp, Interp::Weighted { .. }))
+        );
+    }
+
+    #[test]
+    fn first_half_from_f16_attributes_keeps_the_f32_partial_value() {
+        let p = program(&[0xD742_0002, 0x0002_0000, 0xF800_180F, 0x0202_0202, S_ENDPGM]);
+        let io = raise(
+            &p,
+            &pixel(
+                vec![PsInput {
+                    fp16: true,
+                    ..TEXCOORD
+                }],
+                2,
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            &io.interps[..],
+            [((0, 0), Interp::Weighted { .. })]
+        ));
     }
 
     #[test]

@@ -83,6 +83,7 @@ enum Key {
     Cmp(u8, V, V),
     Select(V, V, V),
     Extract(V, u32),
+    Insert(V, V, u32),
     Call(u32, Vec<V>),
     Gep(Ty, V, Vec<V>),
     Load(V),
@@ -157,7 +158,11 @@ fn resolve(repl: &[Option<V>], mut v: V) -> V {
 /// Replaces every value `op` reads by `f` of it.
 fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
     match op {
-        Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
+        Op::Bin(_, a, b)
+        | Op::Cmp(_, a, b)
+        | Op::Store(a, b)
+        | Op::AtomicRmw(_, a, b)
+        | Op::Insert(a, b, _) => {
             *a = f(*a);
             *b = f(*b);
         }
@@ -612,6 +617,7 @@ impl Module {
             | Op::Cmp(..)
             | Op::Select(..)
             | Op::Extract(..)
+            | Op::Insert(..)
             | Op::Gep(..) => Effect::Pure,
             Op::Load(p) => {
                 // A constant table reads the same whatever is stored.
@@ -653,6 +659,7 @@ impl Module {
             Op::Cmp(p, a, b) => Key::Cmp(*p, *a, *b),
             Op::Select(c, t, f) => Key::Select(*c, *t, *f),
             Op::Extract(a, n) => Key::Extract(*a, *n),
+            Op::Insert(a, v, n) => Key::Insert(*a, *v, *n),
             Op::Call(f, args) => Key::Call(*f, args.clone()),
             Op::Gep(ty, p, idx) => Key::Gep(*ty, *p, idx.clone()),
             Op::Load(p) => Key::Load(*p),

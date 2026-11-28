@@ -7,7 +7,7 @@ GTA VI on Windows PCs with older AMD graphics cards.
 **This repository contains no game files or assets.** You need your own copy
 of the game. Not affiliated with or endorsed by its developer or publisher.
 
-## Status (2026-11-27)
+## Status (2026-11-28)
 
 Work in progress. **Not a playable release yet.**
 
@@ -26,7 +26,7 @@ What is already implemented and tested at shader/PSO level:
 | SM 6.5 shader translation | implemented; the 22 baseline SM 6.6 GPU failures pass on RX 570 |
 | SM 6.5 descriptor tables | implemented; alias-table PSO/dispatch tests pass on RX 570 |
 | Agility / SM 6.6 | optional app-local runtime; real bindless and typed atomic64 GPU tests pass on RX 570; highest reported model is 6.7 |
-| Wave32 compute groups | groups of at most 32 threads run inside physical wave64; 8/8 formerly refused PSOs create with the debug layer |
+| Wave32 compute groups | small groups and a restricted logical wave32 fallback on physical wave64; independent lane reads, ballots and integer bit reductions pass GPU tests |
 | Mesh shader fallback | compute emulation + vertex pulling + one `DrawInstanced`; 9 279 / 9 282 real mesh shaders translate |
 | Amplification shaders | none found in the inspected shader package |
 | BVH / RT profiles | `Full`, `StaticMiss`, `Limited(N)` implemented and tested on RX 570 |
@@ -40,6 +40,7 @@ What is already implemented and tested at shader/PSO level:
 | Streamed textures | upload decisions follow staging refresh, so new data reaches the same submission; partial uploads retry by elapsed time |
 | Memory pressure | reclaim unused staging buffers; configurable sampled-texture budget; root-window tails reduce duplicate data |
 | Shared constants | optional direct GPU access to the title's constants section, with ordered indirect argument preparation |
+| FSR4 and material corrections | real prepass/pass5/postpass/auto-exposure shaders and two formerly oversized material signatures create RX 570 pipelines; gameplay verification remains pending |
 | Precompilation | package shaders and every recorded pipeline state; persistent progress, bounded workers and translator-keyed disk cache |
 | Full game boot / world / FPS | boot, menus and world image confirmed in earlier runs; new rendering fixes still need an in-game comparison after full precompilation |
 
@@ -59,27 +60,35 @@ Latest validation on the RX 570:
 
 Known limitations:
 
+- The [28 November shader corrections](docs/rx570-fsr4-2026-11-28.md) pass
+  focused GPU checks, but normal gameplay graphics and sustained five FPS
+  have not yet been established for the new release.
+
 - A Series S SM 6.6 run on 27 November lost the display signal after desktop
   artifacts; Windows recorded a video-engine timeout. Host-copy pressure and
   stale root-buffer binding faults were corrected, but the exact GPU fault
   and gameplay stability remain unverified. See [the incident analysis](docs/rx570-gpu-timeout-2026-11-27.md).
-- The complete SM 6.6 archive pass prepared **25,586 translations**, refused
-  303 records and skipped 614 duplicates out of 26,503 records. All 679 records
-  previously refused for SM 6.6 image atomics now translate. Of the remaining
-  refusals, 195 contain no stage supported by this translator; other gaps include
-  descriptor control flow and descriptor data reads. Translation success does
-  not by itself establish correct execution of every game shader.
+- The latest SM 6.6 archive pass prepared **25,345 translations**, refused
+  544 records and skipped 614 duplicates out of 26,503 records. The earlier
+  translator prepared 25,635 and refused 254; this increase in refusals still
+  needs a per-shader comparison. Do not treat safer refusals or a higher Shader
+  Model as proof of complete rendering. The upscaler DLL now prepares 28 of 29
+  records; neural pass6 still refuses a root-descriptor data read. BVH-builder
+  preparation reports 44 ready and 8 refused. Pipeline preparation was stopped
+  at the user's request and did not report completion. The new release has
+  not undergone an in-game performance comparison.
 - Driver 31.0.21925.1001 loses conflicting typed atomic updates for literal
   uniform texture coordinates in a synthetic test, including atomic32.
   Dynamic coordinates and explicit wave serialization pass. This is a separate
   correctness issue; an advertised shader model does not establish correctness
   for every shader. See [the capability investigation](docs/rx570-agility.md).
-- Native wave32 compute groups larger than 32 threads still require subwave
-  emulation on Polaris. They are excluded from the small-group wave64 correction;
-  successful PSO creation alone does not verify their cross-lane semantics.
-- The recorded set contains **83,562 pipeline states**. The first full warm
-  with the final SM 6.6 translator must finish before the next game run.
-  Preparation of every state is not yet a verified result.
+- Native wave32 compute groups larger than 32 threads that depend on cross-lane
+  operations can still require subwave emulation on Polaris. Six plain variants
+  already create PSOs without WaveSize metadata; this does not verify the
+  cross-lane semantics of other variants.
+- The recorded Series X set contains **83,562 pipeline states**. Full PSO
+  preparation remains optional and has not completed with the current SM 6.6
+  translator. Shader-only preparation is available with `--shaders-only`.
 - 16 GiB RAM is below the practical working set observed in related forks;
   a large pagefile is required and performance will still be limited.
 - Shader translation and driver pipeline refusals still omit rendering passes.
@@ -148,6 +157,40 @@ environment as the launcher.
 
 `--jobs` controls compilation threads. Without it, preparation uses every
 logical CPU core, up to 16 threads; pass `--jobs 3` to reduce CPU and memory use.
+To prepare package shader translations without creating recorded pipeline
+states, then run in Series X mode:
+
+```powershell
+.\target\release\victory.exe precompile "<your game folder>\<the game's exe>" --console series-x --shaders-only --jobs 8
+.\target\release\victory.exe run "<your game folder>\<the game's exe>" --console series-x --execute --record-pipelines
+```
+
+Use the same shader profile and cache directory for both commands. Existing
+shader translations are reused. Pipeline objects are created on demand during
+the game; `--record-pipelines` saves their recipes for later preparation.
+`--shaders-only` cannot be combined with `--used-only`.
+
+For a rendering diagnostic, `run --execute --record-pipelines --precompile-bakes`
+loads and retains only previously requested recipes for four known one-time
+pixel bake shaders before the title starts. Other pipelines remain on demand.
+This is separate from shader-only preparation. A refused or unreadable required
+recipe stops execution rather than silently running an incomplete bake.
+
+Release builds can save presented frames with `VICTORY_CAPTURE=<folder>` and
+`VICTORY_CAPTURE_WORLD=1`. Set `VICTORY_CAPTURE_LIMIT=32` and
+`VICTORY_CAPTURE_INTRO_LIMIT=8` to bound output while reserving captures for the
+world. Target dumps and detailed black-frame probes still require diagnostics.
+Writing an increasing integer to `<capture folder>/capture.request` requests
+one additional current frame, including when the automatic quota is exhausted.
+
+For local integration tests, `VICTORY_INPUT_COMMANDS=<file>` accepts one
+command such as `1 Enter 200`: increasing ID, supported keyboard key and hold
+in milliseconds (1-2000). `Enter` maps to gamepad A. Commands affect only this
+runtime's GameInput readings, work without window focus, and release on expiry
+or a missing/invalid command file. The file is read at most every 50 ms;
+repeating an ID does not press the key again. Scheduled `VICTORY_KEYS` also
+works in release. Both controls are inactive when their variables are unset.
+
 Add `--used-only` to build only states used in previous runs.
 For a bounded preparation, set `$env:VICTORY_PRECOMPILE_TOTAL = "20000"`
 before running `precompile`. It selects at most the first 20,000 recipes,
@@ -222,8 +265,17 @@ see `victory.example.toml` and `docs/architecture.md`.
 | `VICTORY_PORT_CONSTANTS=1` | GPU reads and writes a contiguous low-address constants section in place; falls back to copies if opening it fails |
 | `VICTORY_WINDOW_TAILS=1` | omit unused prefixes of root-view memory windows |
 | `VICTORY_CARD_BUFFERS_MB=768` | launcher budget for buffer copies held in VRAM |
+| `VICTORY_BUFFER_WARM_MS=16` | time budget shared by initial indexed-buffer preparation across heaps per presented frame; `VICTORY_BUFFER_WARM_US` takes precedence |
+| `VICTORY_BUFFER_WARM_MB=32` | budget for unique copies first admitted by indexed-buffer preparation; `VICTORY_BUFFER_WARM_BYTES` takes precedence |
 | `VICTORY_D3D12_DRED=1` | report commands in flight on GPU failure |
 | `VICTORY_GPU_TIMING=1` | GPU timing diagnostics (use with DRED/diagnostics build) |
+
+Initial indexed-buffer preparation keeps its cursor across frames and gives
+active heaps turns. A driver allocation is indivisible and can exceed one
+budget. Refreshing already-ready buffers and direct/table accesses remain
+outside this preparation budget. Temporary copy-budget refusals are retried
+after a later present; invalid or permanently oversized views remain null.
+These controls do not set a limit on total frame time.
 
 ## Documentation
 

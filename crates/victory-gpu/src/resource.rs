@@ -137,6 +137,10 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
 /// gives it (`victory-hle`'s `xg` serves the same): the description's
 /// layout field is `0x100 | swizzle mode`, 1 linear, 0 the library's pick.
 pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
+    texture::Texture::new(&texture_desc(desc)?).ok()
+}
+
+fn texture_desc(desc: &ResourceDesc) -> Option<texture::TextureDesc> {
     use texture::{Dimension, Swizzle, TextureDesc};
     const TEXTURE_1D: u32 = 2;
     const TEXTURE_2D: u32 = 3;
@@ -157,7 +161,7 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
         l if l & !0xff == 0x100 => Swizzle(l & 0xff),
         _ => return None,
     };
-    texture::Texture::new(&TextureDesc {
+    Some(TextureDesc {
         dimension,
         width: u32::try_from(desc.width).ok()?,
         height: desc.height,
@@ -167,7 +171,6 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
         samples: desc.sample_count.max(1),
         swizzle,
     })
-    .ok()
 }
 
 /// Bytes and alignment a resource takes: buffers their width (64 KiB
@@ -176,7 +179,7 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
 /// rounded up to the alignment.
 fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
     if desc.dimension != BUFFER
-        && let Some(t) = texture_layout(desc)
+        && let Some(t) = texture_desc(desc).and_then(|d| texture::Texture::allocation(&d).ok())
     {
         // As the console: the layout's own alignment unless more is asked
         // (4 KiB for 4 KiB modes, where PC says 64 KiB).
@@ -1524,6 +1527,13 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     if r.desc.dimension == BUFFER {
         return None;
     }
+    {
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        if made.is_some() {
+            r.host.used.store(crate::host::moment(), Relaxed);
+            return made.clone();
+        }
+    }
     if make && !r.host.refused.load(Relaxed) {
         // A sampled host copy over the profile's budget: let go of the ones
         // nothing names, without holding this texture's lock (the sweep takes
@@ -2846,6 +2856,50 @@ mod tests {
     }
 
     #[test]
+    fn footprint_metadata_matches_full_console_layout() {
+        let mut checked = 0;
+        for dimension in [TEXTURE_1D, 3, TEXTURE_3D] {
+            for format in [1, 20, 28, 45, 60, 71, 77, 98, 118] {
+                for layout in [
+                    0, 1, 0x101, 0x102, 0x105, 0x106, 0x109, 0x10a, 0x111, 0x112, 0x115, 0x118,
+                    0x119, 0x11b,
+                ] {
+                    for samples in [1, 2, 4, 8] {
+                        for mips in [0, 1, 5] {
+                            for flags in [0, 1, 2] {
+                                let d = ResourceDesc {
+                                    dimension,
+                                    layout,
+                                    flags,
+                                    sample_count: samples,
+                                    height: if dimension == TEXTURE_1D { 1 } else { 73 },
+                                    depth_or_array_size: 3,
+                                    ..texture(137, 73, format, mips)
+                                };
+                                if let Some(reference) = texture_layout(&d) {
+                                    for alignment in [0, 4096, KIB_64, MIB_4] {
+                                        let alignment = alignment.max(reference.alignment);
+                                        assert_eq!(
+                                            footprint(&ResourceDesc { alignment, ..d }),
+                                            Some(AllocationInfo {
+                                                size: reference.size.next_multiple_of(alignment),
+                                                alignment,
+                                            }),
+                                            "{d:?}"
+                                        );
+                                    }
+                                    checked += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 1000);
+    }
+
+    #[test]
     fn sizes_cover_every_mip() {
         let size = |d: &ResourceDesc| footprint(d).map(|i| i.size);
         assert_eq!(size(&buffer(256)), Some(KIB_64));
@@ -2940,18 +2994,41 @@ mod tests {
     #[test]
     fn streamed_texture_changes_after_recording_reach_the_same_submission() {
         use windows::Win32::Graphics::Direct3D12::*;
-        let Some(host) = crate::host::host() else { return };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
         let null = std::ptr::null();
         let mut image = null;
-        assert_eq!(create_committed(null, &PROPERTIES, 0, &texture(4, 4, 28, 1),
-            0, null.cast(), &RESOURCE_IIDS[0], &mut image), S_OK);
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &texture(4, 4, 28, 1),
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut image
+            ),
+            S_OK
+        );
         let (memory, desc) = texture_memory(image).unwrap();
         let bytes = texture_layout(&desc).unwrap().size as usize;
         let target = host_resource(image).unwrap();
         let mut footprints = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default()];
         let mut total = 0;
-        unsafe { host.device.GetCopyableFootprints(&target.GetDesc(), 0, 1, 0,
-            Some(footprints.as_mut_ptr()), None, None, Some(&mut total)); }
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &target.GetDesc(),
+                0,
+                1,
+                0,
+                Some(footprints.as_mut_ptr()),
+                None,
+                None,
+                Some(&mut total),
+            );
+        }
         let (back, data) = host.shared_buffer(total).unwrap();
         for value in [0x31u8, 0xa7, 0x5c] {
             let list = host.new_list().unwrap();
@@ -2960,17 +3037,26 @@ mod tests {
             let destination = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: unsafe { std::mem::transmute_copy(&back) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprints[0] },
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: footprints[0],
+                },
             };
             let source = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: unsafe { std::mem::transmute_copy(target) },
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
             };
-            unsafe { list.list.CopyTextureRegion(&destination, 0, 0, 0, &source, None); }
+            unsafe {
+                list.list
+                    .CopyTextureRegion(&destination, 0, 0, 0, &source, None);
+            }
             list.close();
             crate::watch::writing(memory as usize, bytes);
-            unsafe { std::ptr::write_bytes(memory as *mut u8, value, bytes); }
+            unsafe {
+                std::ptr::write_bytes(memory as *mut u8, value, bytes);
+            }
             crate::watch::wrote(memory as usize, bytes);
             host.execute(&[&list]);
             let read = unsafe { std::slice::from_raw_parts(data, total as usize) };

@@ -132,6 +132,7 @@ pub(crate) enum Shape {
 pub(crate) struct Section {
     pub end: usize,
     pub shapes: HashMap<Value, Shape>,
+    pub reads: HashMap<Value, Shape>,
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -169,8 +170,29 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
+        let (vec, uni) = simulate(&insts[i + 1..end], wave, saved);
+        let mut reads = HashMap::new();
+        for later in insts[end + 1..]
+            .iter()
+            .filter(|i| i.name() == "v_readlane_b32")
+        {
+            if let Fields::Valu(v) = &later.fields
+                && later.read(Reg::S(EXEC)) == insts[end].write(Reg::S(EXEC))
+                && (!p.wave64 || later.read(Reg::S(EXEC + 1)) == insts[end].write(Reg::S(EXEC + 1)))
+                && let (Some(Operand::Scalar { code, .. }), [Operand::Vector { reg, .. }, lane]) =
+                    (v.dst, &v.src[..])
+                && let Some(left) = later.read(Reg::V(*reg)).and_then(|x| vec.get(&x))
+                && let Some(w) = later.write(Reg::S(code))
+                && let Some(l) = lane_number(lane)
+                && let Some(&sym) = left.get(l as usize)
+                && !matches!(sym, Sym::Own(_))
+                && let Some(shape) = single(sym, wave)
+            {
+                reads.insert(w, shape);
+            }
+        }
+        let shapes = shapes(vec, uni, wave);
+        out.insert(i, Section { end, shapes, reads });
         i = end + 1;
     }
     out
@@ -257,7 +279,17 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+fn lane_number(op: &Operand) -> Option<u32> {
+    match *op {
+        Operand::Const(c) => crate::resource::inline(c),
+        Operand::Literal(x) => Some(x),
+        _ => None,
+    }
+}
+
+type Left = (HashMap<Value, Vec<Sym>>, HashMap<Value, Sym>);
+
+fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -278,7 +310,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 .then(|| constant(inst))
                 .flatten();
             let Some(k) = lo else {
-                return shapes(vec, uni, wave);
+                return (vec, uni);
             };
             exec = (if name == "s_mov_b64" {
                 k
@@ -293,7 +325,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 .then(|| constant(inst))
                 .flatten()
             else {
-                return shapes(vec, uni, wave);
+                return (vec, uni);
             };
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
@@ -435,7 +467,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     })
                     .collect()
             }
-            ("v_permlanex16_b32", Some(a)) => {
+            ("v_permlanex16_b32", Some(a)) if v.opsel == 0 && v.opsel_hi == 0 => {
                 // Lanes of each row read the other row of their half; lane
                 // i's pick is nibble i of {src2, src1}.
                 let sel = |k: usize| match v.src.get(k) {
@@ -450,7 +482,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                             .map(|l| {
                                 let other = (l & !31) | ((l & 16) ^ 16);
                                 let pick = (s >> (4 * (l & 15)) & 15) as u32;
-                                a[(other | pick) as usize]
+                                let source = other | pick;
+                                if exec >> source & 1 != 0 {
+                                    a[source as usize]
+                                } else {
+                                    old[l as usize]
+                                }
                             })
                             .collect()
                     }
@@ -514,7 +551,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             .collect();
         vec.insert(dst, merged);
     }
-    shapes(vec, uni, wave)
+    (vec, uni)
 }
 
 fn constant(inst: &Inst) -> Option<u64> {
@@ -538,6 +575,22 @@ fn constant(inst: &Inst) -> Option<u64> {
     }
 }
 
+fn single(s: Sym, wave: u32) -> Option<Shape> {
+    let all = u64::MAX >> (64 - wave);
+    match s {
+        Sym::K(k) => Some(Shape::K(k)),
+        Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
+        Sym::Red {
+            op: Some(op),
+            src,
+            mask,
+            ident,
+            lanes,
+        } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+        _ => None,
+    }
+}
+
 /// The shape of each value, where every lane agrees on one.
 fn shapes(
     vec: HashMap<Value, Vec<Sym>>,
@@ -550,20 +603,8 @@ fn shapes(
         u64::from(u32::MAX)
     };
     let mut out = HashMap::new();
-    let single = |s: Sym| match s {
-        Sym::K(k) => Some(Shape::K(k)),
-        Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
-        Sym::Red {
-            op: Some(op),
-            src,
-            mask,
-            ident,
-            lanes,
-        } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
-        _ => None,
-    };
     for (v, s) in uni {
-        if let Some(sh) = single(s) {
+        if let Some(sh) = single(s, wave) {
             out.insert(v, sh);
         }
     }
@@ -663,6 +704,28 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
 /// `WaveActiveBitOr(v7)` into s7 as the console compiler expands it: every lane takes part,
 /// those outside the saved EXEC (s[4:5]) with 0.
 #[cfg(test)]
+pub(super) const LATE_OR_SECTION: [u32; 18] = [
+    0xBE90_25C1,
+    0xD501_0001,
+    0x0042_0E80,
+    0x3802_02FA,
+    0xFF04_B101,
+    0x3802_02FA,
+    0xFF04_4E01,
+    0x3802_02FA,
+    0xFF05_4101,
+    0x3802_02FA,
+    0xFF05_4001,
+    0xD778_0002,
+    0x0201_0101,
+    0x3802_0501,
+    0xD760_0012,
+    0x0001_0101,
+    0x3802_0212,
+    0xBEFE_0410,
+];
+
+#[cfg(test)]
 pub(super) const WAVE_OR_V7_TO_S7: [u32; 20] = [
     0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
     0xD501_0001,
@@ -727,6 +790,66 @@ mod tests {
             .flat_map(u32::to_le_bytes)
             .collect();
         crate::ir::build(&code, wave64, 256).unwrap()
+    }
+
+    #[test]
+    fn late_readlane_uses_only_the_selected_lane_shape() {
+        for wave64 in [false, true] {
+            for lane in 0..64u16 {
+                let mut words = LATE_OR_SECTION.to_vec();
+                words.extend(vop3(19, 0x360, 0x101, 128 + lane, 0));
+                let p = build(&words, wave64);
+                let insts = &p.blocks[0].insts;
+                let found = sections(&p, 0);
+                let sec = &found[&0];
+                let input = p.inputs.iter().find(|(r, _)| *r == Reg::V(7)).unwrap().1;
+                let saved = insts[0].write(Reg::S(16)).unwrap();
+                let whole_vector = insts[sec.end - 1].write(Reg::V(1)).unwrap();
+                if wave64 {
+                    assert_eq!(sec.shapes.get(&whole_vector), None);
+                }
+                let result = insts[sec.end + 1].write(Reg::S(19)).unwrap();
+                let expected = if wave64 { lane >= 32 } else { lane < 32 };
+                assert_eq!(
+                    sec.reads.get(&result).copied(),
+                    expected.then_some(Shape::Active(Op::Or, input, saved, 0)),
+                    "wave64={wave64}, lane={lane}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn late_readlane_rejects_unknown_lanes_and_changed_exec() {
+        for wave64 in [false, true] {
+            for (changes, lane) in [
+                (Vec::new(), 22u16),
+                (Vec::new(), 192),
+                (vec![sop1(EXEC, 0x03, 129)], 191),
+                (vec![sop1(EXEC + 1, 0x03, 130)], 191),
+            ] {
+                if !wave64 && changes == vec![sop1(EXEC + 1, 0x03, 130)] {
+                    continue;
+                }
+                let mut words = LATE_OR_SECTION.to_vec();
+                words.extend(changes);
+                words.extend(vop3(19, 0x360, 0x101, lane, 0));
+                let p = build(&words, wave64);
+                assert!(sections(&p, 0)[&0].reads.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn late_readlane_does_not_replace_another_lanes_own_value() {
+        let mut words = vec![
+            sop1(16, 0x25, 193),
+            vop1(1, 0x01, 0x107),
+            sop1(EXEC, 0x04, 16),
+        ];
+        words.extend(vop3(19, 0x360, 0x101, 191, 0));
+        let p = build(&words, true);
+        assert!(sections(&p, 0)[&0].reads.is_empty());
     }
 
     #[test]
@@ -998,6 +1121,38 @@ mod tests {
         let sec = &sections(&p, 0)[&0];
         assert_eq!(sec.shapes.get(&v2_val), Some(&Shape::K(7)));
         assert_eq!(sec.shapes.get(&v3_val), Some(&Shape::K(7)));
+    }
+
+    #[test]
+    fn permlanex16_preserves_old_values_for_inactive_sources() {
+        for wave64 in [false, true] {
+            for modifiers in [0, 1 << 11, 1 << 12] {
+                let mut words = vec![
+                    vop1(0, 1, 255),
+                    123,
+                    vop1(1, 1, 255),
+                    456,
+                    sop1(EXEC, 3, 255),
+                    1 << 16,
+                ];
+                let mut permute = vop3(1, 0x378, 0x100, 128, 128);
+                permute[0] |= modifiers;
+                words.extend(permute);
+                words.extend(vop3(7, 0x360, 0x101, 144, 128));
+                let p = build(&words, wave64);
+                let insts = &p.blocks[0].insts;
+                let (_, uniform) = simulate(insts, if wave64 { 64 } else { 32 }, Value(0));
+                let read = insts[insts.len() - 2].write(Reg::S(7)).unwrap();
+                assert_eq!(
+                    uniform.get(&read),
+                    Some(&if modifiers == 0 {
+                        Sym::K(456)
+                    } else {
+                        Sym::Unknown
+                    })
+                );
+            }
+        }
     }
 
     #[test]

@@ -19,13 +19,15 @@ mod windows {
         jobs: Option<usize>,
         used_only: bool,
         retain_used: bool,
+        shaders_only: bool,
     ) -> Result<()> {
         let jobs = jobs
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, usize::from))
             .clamp(1, 16);
-        tracing::info!(jobs, "shader and pipeline preparation threads");
+        tracing::info!(jobs, shaders_only, "preparation threads");
         let tag = victory_gpu::shader_cache::precompile_setup().map_err(anyhow::Error::msg)?;
-        let worker = std::env::var("VICTORY_PRECOMPILE_WORKER").is_ok_and(|value| value == "1");
+        let worker = !shaders_only
+            && std::env::var("VICTORY_PRECOMPILE_WORKER").is_ok_and(|value| value == "1");
         if !worker {
             let cache = cfg.cache_subdir("shader-scan")?;
             let paths = match inputs {
@@ -36,6 +38,14 @@ mod windows {
             for path in paths {
                 scan(&path, &cache, tag, jobs, &seen)?;
             }
+        }
+        if shaders_only {
+            println!(
+                "shader preparation complete; pipeline prebuild skipped ({}, {})",
+                console_name(console),
+                &title_hash[..12]
+            );
+            return Ok(());
         }
         let report = if worker {
             victory_gpu::pipeline::precompile_pipelines(jobs, used_only, false)?

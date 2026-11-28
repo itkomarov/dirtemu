@@ -326,6 +326,8 @@ pub(crate) struct Shader {
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
     pub wave_size: Option<u32>,
+    pub half32: bool,
+    pub half32_unsupported: bool,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
@@ -391,6 +393,8 @@ impl Shader {
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
+            half32: false,
+            half32_unsupported: false,
             lds_dwords: 0,
             lds: None,
             main,
@@ -412,6 +416,172 @@ impl Shader {
 
     /// Calls `dx.op.<name>` (class and overload) with `opcode` and `args`.
     pub fn op(
+        &mut self,
+        block: usize,
+        name: &str,
+        attr: Attr,
+        ret: Ty,
+        opcode: u32,
+        args: &[V],
+    ) -> V {
+        if self.half32 && (name.starts_with("wave") || name.starts_with("quad")) {
+            let valid = match (opcode, name) {
+                (111, "waveGetLaneIndex") => ret == self.t.i32 && args.is_empty(),
+                (116, "waveActiveBallot") => {
+                    let four = self.m.named_struct("dx.types.fouri32", vec![self.t.i32; 4]);
+                    ret == four && args.len() == 1 && self.m.type_of(args[0]) == self.t.i1
+                }
+                (117, "waveReadLaneAt.i32") => {
+                    ret == self.t.i32
+                        && args.len() == 2
+                        && args.iter().all(|arg| self.m.type_of(*arg) == self.t.i32)
+                }
+                (118, "waveReadLaneFirst.i32") => {
+                    ret == self.t.i32 && args.len() == 1 && self.m.type_of(args[0]) == self.t.i32
+                }
+                (120, "waveActiveBit.i32") => {
+                    let i8t = self.m.int(8);
+                    ret == self.t.i32
+                        && args.len() == 2
+                        && self.m.type_of(args[0]) == self.t.i32
+                        && self.m.type_of(args[1]) == i8t
+                        && matches!(self.m.int_value(args[1]), Some(0..=2))
+                }
+                _ => false,
+            };
+            if valid {
+                return self.half32_op(block, ret, opcode, args);
+            }
+            #[cfg(test)]
+            eprintln!("logical wave32 uncovered operation: {name} opcode={opcode}");
+            self.half32_unsupported = true;
+        }
+        self.raw_op(block, name, attr, ret, opcode, args)
+    }
+
+    fn physical_lane(&mut self, block: usize) -> V {
+        self.raw_op(
+            block,
+            "waveGetLaneIndex",
+            Attr::ReadOnly,
+            self.t.i32,
+            111,
+            &[],
+        )
+    }
+
+    fn half32_target(&mut self, block: usize, lane: V) -> V {
+        let physical = self.physical_lane(block);
+        let mask = self.m.i32(!31);
+        let base = self.m.bin(block, super::bitcode::Bin::And, physical, mask);
+        self.m.bin(block, super::bitcode::Bin::Add, base, lane)
+    }
+
+    fn half32_ballot(&mut self, block: usize, condition: V) -> V {
+        let four = self.m.named_struct("dx.types.fouri32", vec![self.t.i32; 4]);
+        let ballot = self.raw_op(
+            block,
+            "waveActiveBallot",
+            Attr::NoUnwind,
+            four,
+            116,
+            &[condition],
+        );
+        let low = self.m.extract(block, ballot, 0);
+        let high = self.m.extract(block, ballot, 1);
+        let lane = self.physical_lane(block);
+        let boundary = self.m.i32(32);
+        let upper = self
+            .m
+            .cmp(block, super::bitcode::pred::IUGE, lane, boundary);
+        self.m.select(block, upper, high, low)
+    }
+
+    fn half32_op(&mut self, block: usize, ret: Ty, opcode: u32, args: &[V]) -> V {
+        match opcode {
+            111 => {
+                let lane = self.physical_lane(block);
+                let mask = self.m.i32(31);
+                self.m.bin(block, super::bitcode::Bin::And, lane, mask)
+            }
+            116 => {
+                let mask = self.half32_ballot(block, args[0]);
+                let zero = self.m.i32(0);
+                let mut result = self.m.undef(ret);
+                for (index, value) in [mask, zero, zero, zero].into_iter().enumerate() {
+                    result = self.m.insert(block, result, value, index as u32);
+                }
+                result
+            }
+            117 => {
+                let target = self.half32_target(block, args[1]);
+                self.raw_op(
+                    block,
+                    "waveReadLaneAt.i32",
+                    Attr::NoUnwind,
+                    ret,
+                    117,
+                    &[args[0], target],
+                )
+            }
+            118 => {
+                let yes = self.m.bool(true);
+                let mask = self.half32_ballot(block, yes);
+                let first = self.raw_op(
+                    block,
+                    "unaryBits.i32",
+                    Attr::ReadNone,
+                    self.t.i32,
+                    32,
+                    &[mask],
+                );
+                let target = self.half32_target(block, first);
+                self.raw_op(
+                    block,
+                    "waveReadLaneAt.i32",
+                    Attr::NoUnwind,
+                    ret,
+                    117,
+                    &[args[0], target],
+                )
+            }
+            120 => {
+                let identity = match self.m.int_value(args[1]) {
+                    Some(0) => u32::MAX,
+                    Some(1 | 2) => 0,
+                    _ => unreachable!(),
+                };
+                let identity = self.m.i32(identity);
+                let lane = self.physical_lane(block);
+                let boundary = self.m.i32(32);
+                let upper = self
+                    .m
+                    .cmp(block, super::bitcode::pred::IUGE, lane, boundary);
+                let low_arg = self.m.select(block, upper, identity, args[0]);
+                let high_arg = self.m.select(block, upper, args[0], identity);
+                let low = self.raw_op(
+                    block,
+                    "waveActiveBit.i32",
+                    Attr::NoUnwind,
+                    ret,
+                    120,
+                    &[low_arg, args[1]],
+                );
+                let high = self.raw_op(
+                    block,
+                    "waveActiveBit.i32",
+                    Attr::NoUnwind,
+                    ret,
+                    120,
+                    &[high_arg, args[1]],
+                );
+                self.m.select(block, upper, high, low)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn raw_op(
         &mut self,
         block: usize,
         name: &str,
@@ -601,6 +771,7 @@ impl Shader {
         nonuniform: bool,
         props: (u32, u32),
     ) -> V {
+        let nonuniform = nonuniform || self.half32;
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
         let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
@@ -779,14 +950,34 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(self) -> Vec<u8> {
-        self.finish_with_tags().0
+        self.try_finish()
+            .expect("shader composites must be projected")
+    }
+
+    pub fn try_finish(mut self) -> Result<Vec<u8>, &'static str> {
+        self.m.validate_composites()?;
+        super::bitcode::input_signature::compact_software_barycentrics(&mut self)?;
+        Ok(self.finish_with_tags_validated().0)
     }
 
     /// The finished container and the entry-point property tags it
     /// declares (the profile tests read them).
+    #[cfg(test)]
     pub fn finish_with_tags(mut self) -> (Vec<u8>, Vec<u32>) {
-        let physical_wave =
-            physical_wave_size(self.wave_size, self.threads, super::lower::host_min_wave());
+        self.m
+            .validate_composites()
+            .expect("shader composites must be projected");
+        super::bitcode::input_signature::compact_software_barycentrics(&mut self)
+            .expect("software barycentric input signature must fit");
+        self.finish_with_tags_validated()
+    }
+
+    fn finish_with_tags_validated(mut self) -> (Vec<u8>, Vec<u32>) {
+        let physical_wave = if self.half32 {
+            Some(64)
+        } else {
+            physical_wave_size(self.wave_size, self.threads, super::lower::host_min_wave())
+        };
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a

@@ -1851,6 +1851,8 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    buffer_heap_ids: std::collections::HashSet<u64>,
+    buffer_recording_id: u64,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -5664,6 +5666,19 @@ impl HostList {
         }
     }
 
+    pub(crate) fn first_heap_use(&self, id: u64) -> bool {
+        self.deferred().buffer_heap_ids.insert(id)
+    }
+
+    pub(crate) fn buffer_recording_id(&self) -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let mut deferred = self.deferred();
+        if deferred.buffer_recording_id == 0 {
+            deferred.buffer_recording_id = NEXT.fetch_add(1, Ordering::Relaxed);
+        }
+        deferred.buffer_recording_id
+    }
+
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
@@ -6619,10 +6634,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             let sample_planes = std::env::var_os("VICTORY_CAPTURE_PLANES").is_some()
                 && crate::capture::listed(frame);
-            #[cfg(feature = "diagnostics")]
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
-            #[cfg(not(feature = "diagnostics"))]
-            let read_now = false;
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead
@@ -6761,7 +6773,6 @@ impl Host {
                     .and_then(|(tex, before)| plane(tex, D3D12_RESOURCE_STATES(before as i32)));
                 [base, overlay]
             });
-            #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| {
                     if composed {
@@ -6818,7 +6829,6 @@ impl Host {
                     self.execute(&[copy]);
                 }
             };
-            #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }

@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 pub mod census;
+pub(super) mod input_signature;
 pub mod opt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -151,6 +152,7 @@ enum Op {
     Cmp(u8, V, V),
     Select(V, V, V),
     Extract(V, u32),
+    Insert(V, V, u32),
     Call(u32, Vec<V>),
     /// Filled in later: (value, block).
     Phi(Vec<(V, usize)>),
@@ -431,13 +433,33 @@ impl Module {
         let ty = self.type_of(t);
         self.push(block, ty, Op::Select(c, t, f))
     }
-    pub fn extract(&mut self, block: usize, agg: V, index: u32) -> V {
+    pub fn extract(&mut self, block: usize, mut agg: V, index: u32) -> V {
+        while let V::Inst(i) = agg {
+            match self.insts[i as usize].op {
+                Op::Insert(previous, value, field) => {
+                    if field == index {
+                        return value;
+                    }
+                    agg = previous;
+                }
+                _ => break,
+            }
+        }
         let ty = match &self.types[self.type_of(agg).0 as usize] {
             TypeDef::Struct(_, f) => f[index as usize],
             TypeDef::Array(_, t) => *t,
             t => panic!("extractvalue from {t:?}"),
         };
         self.push(block, ty, Op::Extract(agg, index))
+    }
+    pub fn insert(&mut self, _block: usize, aggregate: V, value: V, index: u32) -> V {
+        let ty = self.type_of(aggregate);
+        let result = V::Inst(self.insts.len() as u32);
+        self.insts.push(Inst {
+            ty,
+            op: Op::Insert(aggregate, value, index),
+        });
+        result
     }
     pub fn call(&mut self, block: usize, f: V, args: Vec<V>) -> V {
         let V::Func(i) = f else {
@@ -547,6 +569,31 @@ impl Module {
             });
         }
         live
+    }
+
+    pub fn validate_composites(&self) -> Result<(), &'static str> {
+        let composite = |value| matches!(value, V::Inst(i) if matches!(self.insts[i as usize].op, Op::Insert(..)));
+        let mut escaped = false;
+        for block in &self.blocks {
+            for &index in block.phis.iter().chain(&block.body) {
+                let op = &self.insts[index as usize].op;
+                escaped |= matches!(op, Op::Insert(..));
+                for_each_operand(op, |value| escaped |= composite(value));
+            }
+            if let Some(Term::CondBr(value, ..)) = block.term {
+                escaped |= composite(value);
+            }
+        }
+        for metadata in &self.mds {
+            if let MdDef::Value(_, value) = metadata {
+                escaped |= composite(*value);
+            }
+        }
+        if escaped {
+            Err("a logical wave32 ballot used as an aggregate")
+        } else {
+            Ok(())
+        }
     }
 
     pub fn write(&self) -> Vec<u8> {
@@ -844,6 +891,9 @@ impl Module {
                     Op::Cmp(p, a, b) => w.record(28, &[rel(*a), rel(*b), u64::from(*p)]),
                     Op::Select(c, t, f) => w.record(29, &[rel(*t), rel(*f), rel(*c)]),
                     Op::Extract(a, idx) => w.record(26, &[rel(*a), u64::from(*idx)]),
+                    Op::Insert(..) => {
+                        unreachable!("a composite must be projected before bitcode emission")
+                    }
                     Op::Call(f, args) => {
                         r.clear();
                         r.extend([0, 1 << 15, u64::from(self.funcs[*f as usize].ty.0)]);
@@ -909,7 +959,11 @@ const TYPE_BLOCK: u64 = 17;
 /// Calls `f` with every value `op` reads, in operand order.
 fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
     match op {
-        Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
+        Op::Bin(_, a, b)
+        | Op::Cmp(_, a, b)
+        | Op::Store(a, b)
+        | Op::AtomicRmw(_, a, b)
+        | Op::Insert(a, b, _) => {
             f(*a);
             f(*b);
         }

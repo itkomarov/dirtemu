@@ -35,7 +35,7 @@ pub(super) fn configure(dir: PathBuf) -> io::Result<()> {
 pub(super) fn take(key: &str) -> Option<Arc<Pending>> {
     let mut cache = PREPARED.get()?.lock().unwrap_or_else(|e| e.into_inner());
     let state = cache.get_mut(key)?;
-    let pipeline = state.waiting.take().or_else(|| state.active.upgrade())?;
+    let pipeline = state.take()?;
     let reused = REUSED.fetch_add(1, Ordering::Relaxed) + 1;
     if reused.is_power_of_two() {
         tracing::info!(
@@ -49,6 +49,12 @@ pub(super) fn take(key: &str) -> Option<Arc<Pending>> {
 struct Prepared {
     waiting: Option<Arc<Pending>>,
     active: Weak<Pending>,
+}
+
+impl Prepared {
+    fn take(&mut self) -> Option<Arc<Pending>> {
+        self.waiting.take().or_else(|| self.active.upgrade())
+    }
 }
 
 enum Work {
@@ -251,6 +257,140 @@ fn checkpoint(path: &Path, entries: &mut Vec<(String, bool)>) -> anyhow::Result<
     Ok(())
 }
 
+fn bake_header(reader: &mut impl io::Read) -> io::Result<bool> {
+    let mut header = [0; 5];
+    reader.read_exact(&mut header)?;
+    let count = usize::from(header[4]);
+    if &header[..4] != b"VPR1" || count == 0 || count > STAGES.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid recipe header",
+        ));
+    }
+    let mut records = [0; 8 * 33];
+    reader.read_exact(&mut records[..count * 33])?;
+    let mut found = false;
+    for record in records[..count * 33].chunks_exact(33) {
+        let Some(stage) = STAGES.get(usize::from(record[0])) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid shader stage",
+            ));
+        };
+        if *stage == "pixel" {
+            let hash = blake3::Hash::from_bytes(record[1..].try_into().unwrap());
+            found |= crate::draw::BAKE_PIXEL_SHADERS.contains(&&hash.to_hex()[..16]);
+        }
+    }
+    Ok(found)
+}
+
+fn bake_recipes(
+    dir: &Path,
+    wanted: impl Fn(&str) -> bool,
+) -> anyhow::Result<(Vec<PathBuf>, usize)> {
+    let mut files = Vec::new();
+    let mut unreadable = 0;
+    for entry in std::fs::read_dir(dir.join("states"))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(key) = name
+            .to_str()
+            .filter(|key| key.len() == 32 && key.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        else {
+            continue;
+        };
+        if !wanted(key) || !entry.file_type()?.is_file() {
+            continue;
+        }
+        let file = entry.path();
+        let selected = std::fs::File::open(&file).and_then(|mut reader| bake_header(&mut reader));
+        match selected {
+            Ok(true) => files.push(file),
+            Ok(false) => {}
+            Err(error) => {
+                unreadable += 1;
+                tracing::warn!(%error, key, "requested recipe header could not be read for bake preparation");
+            }
+        }
+    }
+    files.sort_unstable();
+    Ok((files, unreadable))
+}
+
+pub(super) fn precompile_bakes(jobs: usize) -> anyhow::Result<Report> {
+    anyhow::ensure!(
+        PREPARED.get().is_none(),
+        "pipeline preparation has already run in this process"
+    );
+    let dir = DIR
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("pipeline recipe cache is not configured"))?;
+    let (files, unreadable) = bake_recipes(dir, super::library::wanted_early)?;
+    let mut report = Report {
+        unreadable,
+        ..Report::default()
+    };
+    let mut ready = HashMap::new();
+    println!("bake pipeline recipes {}", files.len());
+    for batch in files.chunks(128) {
+        let remaining = Mutex::new(batch.iter());
+        let results = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..jobs.clamp(1, 16).min(batch.len()) {
+                scope.spawn(|| {
+                    loop {
+                        let Some(file) = remaining.lock().unwrap_or_else(|e| e.into_inner()).next()
+                        else {
+                            break;
+                        };
+                        let result = load(dir, file).map(|pipeline| {
+                            let built = make::now(&pipeline);
+                            (pipeline, built)
+                        });
+                        results
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((file, result));
+                    }
+                });
+            }
+        });
+        for (file, result) in results.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            match result {
+                Ok((pipeline, true)) => {
+                    report.built += 1;
+                    ready.insert(
+                        pipeline.key().to_owned(),
+                        Prepared {
+                            active: Arc::downgrade(&pipeline),
+                            waiting: Some(pipeline),
+                        },
+                    );
+                }
+                Ok((pipeline, false)) => {
+                    report.refused += 1;
+                    tracing::error!(
+                        key = pipeline.key(),
+                        "required bake pipeline could not be prepared"
+                    );
+                }
+                Err(error) => {
+                    report.unreadable += 1;
+                    tracing::error!(%error, file = %file.display(), "required bake pipeline recipe could not be loaded");
+                }
+            }
+        }
+    }
+    PREPARED
+        .set(Mutex::new(ready))
+        .map_err(|_| anyhow::anyhow!("pipeline preparation was initialized concurrently"))?;
+    println!(
+        "bake pipeline states {} ready, {} refused, {} unreadable",
+        report.built, report.refused, report.unreadable
+    );
+    Ok(report)
+}
 pub(super) fn precompile(
     jobs: usize,
     used_only: bool,
@@ -449,5 +589,133 @@ mod tests {
         let hash = blake3::hash(b"recipe pixel");
         std::fs::write(dir.join("shaders").join(hash.to_hex().as_str()), b"changed").unwrap();
         assert!(load(dir, &path).is_err());
+    }
+    fn stage_record(stage: u8, prefix: &str) -> [u8; 33] {
+        let mut record = [0x9a; 33];
+        record[0] = stage;
+        for i in 0..8 {
+            record[i + 1] = u8::from_str_radix(&prefix[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        record
+    }
+
+    fn recipe_header(records: &[[u8; 33]]) -> Vec<u8> {
+        let mut bytes = b"VPR1".to_vec();
+        bytes.push(records.len() as u8);
+        for record in records {
+            bytes.extend(record);
+        }
+        bytes
+    }
+
+    #[test]
+    fn bake_selection_recognizes_all_known_pixel_hashes_only_at_pixel_stage() {
+        for hash in crate::draw::BAKE_PIXEL_SHADERS {
+            let bytes =
+                recipe_header(&[stage_record(1, "0123456789abcdef"), stage_record(2, hash)]);
+            assert!(bake_header(&mut bytes.as_slice()).unwrap());
+            for stage in [0, 1, 3, 4, 5, 6, 7] {
+                let bytes = recipe_header(&[stage_record(stage, hash)]);
+                assert!(!bake_header(&mut bytes.as_slice()).unwrap());
+            }
+        }
+        let bytes = recipe_header(&[stage_record(2, "0123456789abcdef")]);
+        assert!(!bake_header(&mut bytes.as_slice()).unwrap());
+    }
+
+    #[test]
+    fn bake_selection_reads_only_the_bounded_recipe_header() {
+        let mut records = vec![stage_record(1, "0123456789abcdef"); 8];
+        records[7] = stage_record(2, crate::draw::BAKE_PIXEL_SHADERS[0]);
+        let mut bytes = recipe_header(&records);
+        bytes.extend([0xff; 2048]);
+        let mut reader = io::Cursor::new(bytes);
+        assert!(bake_header(&mut reader).unwrap());
+        assert_eq!(reader.position(), 5 + 8 * 33);
+    }
+
+    #[test]
+    fn bake_selection_reports_corrupt_headers_without_accepting_partial_records() {
+        for bytes in [
+            b"".to_vec(),
+            b"VPR1".to_vec(),
+            b"VPR1\0".to_vec(),
+            b"VPR1\x09".to_vec(),
+            b"VPR2\x01".to_vec(),
+            b"VPR1\x01\x02".to_vec(),
+            recipe_header(&[stage_record(8, crate::draw::BAKE_PIXEL_SHADERS[0])]),
+            recipe_header(&[
+                stage_record(2, crate::draw::BAKE_PIXEL_SHADERS[0]),
+                stage_record(8, "0123456789abcdef"),
+            ]),
+        ] {
+            assert!(
+                bake_header(&mut bytes.as_slice()).is_err(),
+                "accepted {bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bake_recipes_filter_names_and_requested_keys_before_reading_any_shader() {
+        let folder = tempfile::tempdir().unwrap();
+        let dir = folder.path();
+        let states = dir.join("states");
+        std::fs::create_dir(&states).unwrap();
+        let selected = "0123456789abcdef0123456789abcdef";
+        let other = "1123456789abcdef0123456789abcdef";
+        let unused = "2123456789abcdef0123456789abcdef";
+        let bad_name = "3123456789abcdef0123456789abcdef.tmp";
+        let header = recipe_header(&[stage_record(2, crate::draw::BAKE_PIXEL_SHADERS[0])]);
+        std::fs::write(states.join(selected), &header).unwrap();
+        std::fs::write(
+            states.join(other),
+            recipe_header(&[stage_record(2, "0123456789abcdef")]),
+        )
+        .unwrap();
+        std::fs::write(states.join(unused), b"unreadable if opened").unwrap();
+        std::fs::write(states.join(bad_name), b"unreadable if opened").unwrap();
+        std::fs::create_dir(states.join("4123456789abcdef0123456789abcdef")).unwrap();
+        let (files, unreadable) = bake_recipes(dir, |key| key != unused).unwrap();
+        assert_eq!(files, [states.join(selected)]);
+        assert_eq!(unreadable, 0);
+        assert!(!dir.join("shaders").exists());
+    }
+
+    #[test]
+    fn bake_recipes_report_requested_broken_headers_and_select_valid_other_recipes() {
+        let folder = tempfile::tempdir().unwrap();
+        let dir = folder.path();
+        let states = dir.join("states");
+        std::fs::create_dir(&states).unwrap();
+        let good = "abcdef0123456789abcdef0123456789";
+        let bad = "0123456789abcdef0123456789abcdef";
+        std::fs::write(
+            states.join(good),
+            recipe_header(&[stage_record(2, crate::draw::BAKE_PIXEL_SHADERS[3])]),
+        )
+        .unwrap();
+        std::fs::write(states.join(bad), b"VPR1\x02").unwrap();
+        let (files, unreadable) = bake_recipes(dir, |_| true).unwrap();
+        assert_eq!(files, [states.join(good)]);
+        assert_eq!(unreadable, 1);
+    }
+
+    #[test]
+    fn prepared_states_stay_alive_until_runtime_takes_and_reuses_them() {
+        let pipeline = Arc::new(Pending::new(Vec::new(), None));
+        let weak = Arc::downgrade(&pipeline);
+        let mut state = Prepared {
+            active: weak.clone(),
+            waiting: Some(pipeline),
+        };
+        assert_eq!(weak.strong_count(), 1);
+        let runtime = state.take().unwrap();
+        assert!(state.waiting.is_none());
+        let second_runtime = state.take().unwrap();
+        assert!(Arc::ptr_eq(&runtime, &second_runtime));
+        drop(runtime);
+        drop(second_runtime);
+        assert!(state.take().is_none());
     }
 }

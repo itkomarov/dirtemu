@@ -102,6 +102,12 @@ enum Command {
         /// Compile only the pipeline states used by a draw or dispatch in earlier runs.
         #[arg(long)]
         used_only: bool,
+        #[arg(
+            long,
+            conflicts_with = "used_only",
+            help = "Translate package shaders without building pipeline states."
+        )]
+        shaders_only: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -118,6 +124,13 @@ enum Command {
         /// Finish the shader and pipeline precompilation before starting the title.
         #[arg(long, requires = "execute", conflicts_with = "record_pipelines")]
         precompile: bool,
+        #[arg(
+            long,
+            requires = "execute",
+            conflicts_with = "precompile",
+            help = "Prepare only the known one-time bake pipelines before execution."
+        )]
+        precompile_bakes: bool,
         /// With --precompile, compile only previously used pipeline states.
         #[arg(long, requires = "precompile")]
         used_only: bool,
@@ -213,6 +226,7 @@ fn main() -> Result<()> {
             strict,
             execute,
             precompile,
+            precompile_bakes,
             used_only,
             record_pipelines,
             console,
@@ -226,6 +240,7 @@ fn main() -> Result<()> {
             precompile,
             used_only,
             record_pipelines,
+            precompile_bakes,
         ),
         Command::Precompile {
             exe,
@@ -233,6 +248,7 @@ fn main() -> Result<()> {
             shader,
             jobs,
             used_only,
+            shaders_only,
         } => {
             #[cfg(windows)]
             {
@@ -242,7 +258,9 @@ fn main() -> Result<()> {
                 drop(bytes);
                 console.select();
                 victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-                precompile::record(&cfg, hash.as_str(), console)?;
+                if !shaders_only {
+                    precompile::record(&cfg, hash.as_str(), console)?;
+                }
                 precompile::prepare(
                     &cfg,
                     &exe,
@@ -252,11 +270,12 @@ fn main() -> Result<()> {
                     jobs,
                     used_only,
                     false,
+                    shaders_only,
                 )
             }
             #[cfg(not(windows))]
             {
-                let _ = (exe, console, shader, jobs, used_only);
+                let _ = (exe, console, shader, jobs, used_only, shaders_only);
                 anyhow::bail!("shader and pipeline precompilation requires Windows")
             }
         }

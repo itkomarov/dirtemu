@@ -1871,6 +1871,10 @@ extern "system" fn dispatch(_: This) {
 static DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+pub(crate) fn recorded_draws() -> u64 {
+    DRAWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Draws (any kind, mesh and indirect included) and compute dispatches
 /// recorded since the last call.
 pub(crate) fn take_counts() -> (u64, u64) {

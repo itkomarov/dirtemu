@@ -724,6 +724,14 @@ pub fn record_pipeline_recipes(dir: std::path::PathBuf) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
+pub fn precompile_bake_pipelines(jobs: usize) -> anyhow::Result<PipelinePrecompileReport> {
+    anyhow::ensure!(
+        crate::host::host().is_some(),
+        "no D3D12 device for bake precompilation"
+    );
+    recipe::precompile_bakes(jobs.clamp(1, 16))
+}
+#[cfg(windows)]
 pub fn precompile_pipelines(
     jobs: usize,
     used_only: bool,

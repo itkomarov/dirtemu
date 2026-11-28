@@ -27,6 +27,348 @@ use crate::pipeline::host::{HostPipeline, Stage};
 mod ambient;
 mod mesh;
 
+#[derive(Clone, Copy)]
+struct BufferWarmLimits {
+    span: std::time::Duration,
+    bytes: u64,
+}
+
+impl BufferWarmLimits {
+    fn configured() -> &'static Self {
+        static LIMITS: std::sync::OnceLock<BufferWarmLimits> = std::sync::OnceLock::new();
+        LIMITS.get_or_init(|| {
+            let var = |name: &str| std::env::var(name).ok()?.trim().parse::<u64>().ok();
+            let span = var("VICTORY_BUFFER_WARM_US")
+                .map(std::time::Duration::from_micros)
+                .unwrap_or_else(|| {
+                    std::time::Duration::from_millis(var("VICTORY_BUFFER_WARM_MS").unwrap_or(16))
+                });
+            let bytes = var("VICTORY_BUFFER_WARM_BYTES").unwrap_or_else(|| {
+                var("VICTORY_BUFFER_WARM_MB")
+                    .unwrap_or(32)
+                    .saturating_mul(1 << 20)
+            });
+            tracing::info!(
+                micros = span.as_micros() as u64,
+                bytes,
+                "bindless buffer warmup budget per presented frame"
+            );
+            BufferWarmLimits { span, bytes }
+        })
+    }
+}
+
+#[derive(Default)]
+struct BufferWarmBudget {
+    frame: Option<u64>,
+    elapsed: std::time::Duration,
+    bytes: u64,
+    busy: bool,
+    last_served: u64,
+    priority: Option<u64>,
+    priority_done: bool,
+    active: std::collections::BTreeMap<u64, (std::sync::Weak<()>, u64)>,
+    known: std::collections::HashMap<u64, std::sync::Weak<crate::shadow::Shadow>>,
+    ready: BufferReadyCoverage,
+}
+
+#[derive(Default)]
+struct BufferReadyCoverage {
+    presented: Option<u64>,
+    copies: std::collections::HashMap<(u64, u64), Vec<(u64, u64)>>,
+    full: std::collections::HashMap<u64, (std::sync::Weak<crate::shadow::Shadow>, u64)>,
+}
+
+impl BufferReadyCoverage {
+    fn advance(&mut self, presented: u64) -> bool {
+        if self.presented.is_some_and(|current| current > presented) {
+            return false;
+        }
+        if self.presented != Some(presented) {
+            self.presented = Some(presented);
+            self.copies.clear();
+            self.full.retain(|_, (copy, _)| copy.strong_count() != 0);
+        }
+        true
+    }
+
+    fn allow_full(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        presented: u64,
+        interval: u64,
+    ) -> bool {
+        if !self.advance(presented) {
+            return true;
+        }
+        if let Some((_, last)) = self.full.get(&shadow.id())
+            && *last != presented
+            && presented < last.saturating_add(interval)
+        {
+            return false;
+        }
+        self.full
+            .insert(shadow.id(), (std::sync::Arc::downgrade(shadow), presented));
+        true
+    }
+
+    fn claim(
+        &mut self,
+        recording: u64,
+        copy: u64,
+        presented: u64,
+        from: u64,
+        to: u64,
+    ) -> Vec<(u64, u64)> {
+        if from >= to {
+            return Vec::new();
+        }
+        if !self.advance(presented) {
+            return vec![(from, to)];
+        }
+        let covered = self.copies.entry((recording, copy)).or_default();
+        let mut missing = Vec::new();
+        let mut at = from;
+        for &(a, b) in covered.iter() {
+            if b <= at {
+                continue;
+            }
+            if a >= to {
+                break;
+            }
+            if a > at {
+                missing.push((at, a.min(to)));
+            }
+            at = at.max(b);
+            if at >= to {
+                break;
+            }
+        }
+        if at < to {
+            missing.push((at, to));
+        }
+        let first = covered.partition_point(|&(_, end)| end < from);
+        let mut end = first;
+        let mut merged = (from, to);
+        while let Some(&(a, b)) = covered.get(end) {
+            if a > merged.1 {
+                break;
+            }
+            merged.0 = merged.0.min(a);
+            merged.1 = merged.1.max(b);
+            end += 1;
+        }
+        covered.splice(first..end, [merged]);
+        missing
+    }
+}
+
+impl BufferWarmBudget {
+    fn shared() -> &'static std::sync::Mutex<Self> {
+        static BUDGET: std::sync::OnceLock<std::sync::Mutex<BufferWarmBudget>> =
+            std::sync::OnceLock::new();
+        BUDGET.get_or_init(Default::default)
+    }
+
+    fn begin<'a>(
+        budget: &'a std::sync::Mutex<Self>,
+        heap: u64,
+        life: &std::sync::Arc<()>,
+        frame: u64,
+        limits: BufferWarmLimits,
+    ) -> Option<BufferWarmPermit<'a>> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let mut held = budget.lock().unwrap_or_else(|e| e.into_inner());
+        if held.frame.is_some_and(|current| current > frame) {
+            return None;
+        }
+        held.active
+            .retain(|_, (life, seen)| life.strong_count() != 0 && seen.saturating_add(1) >= frame);
+        held.active
+            .insert(heap, (std::sync::Arc::downgrade(life), frame));
+        if held.busy {
+            return None;
+        }
+        if held.frame != Some(frame) {
+            held.frame = Some(frame);
+            held.elapsed = std::time::Duration::ZERO;
+            held.bytes = 0;
+            held.priority_done = false;
+            held.priority = held
+                .active
+                .range((Excluded(held.last_served), Unbounded))
+                .next()
+                .or_else(|| held.active.first_key_value())
+                .map(|(&id, _)| id);
+            held.known.retain(|_, copy| copy.strong_count() != 0);
+        }
+        if held
+            .priority
+            .is_some_and(|id| !held.active.contains_key(&id))
+        {
+            held.priority = Some(heap);
+        }
+        if limits.span.is_zero()
+            || limits.bytes == 0
+            || held.elapsed >= limits.span
+            || held.bytes >= limits.bytes
+            || (!held.priority_done && held.priority != Some(heap))
+        {
+            return None;
+        }
+        held.busy = true;
+        held.priority_done = true;
+        drop(held);
+        Some(BufferWarmPermit {
+            budget,
+            heap,
+            frame,
+            began: std::time::Instant::now(),
+            copy: None,
+        })
+    }
+
+    fn forget(&mut self, heap: u64) {
+        self.active.remove(&heap);
+    }
+}
+
+struct BufferWarmPermit<'a> {
+    budget: &'a std::sync::Mutex<BufferWarmBudget>,
+    heap: u64,
+    frame: u64,
+    began: std::time::Instant,
+    copy: Option<(u64, u64, std::sync::Weak<crate::shadow::Shadow>)>,
+}
+
+impl BufferWarmPermit<'_> {
+    fn copied(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) -> u64 {
+        let bytes = unsafe { shadow.buffer.GetDesc() }.Width;
+        let fresh = !self
+            .budget
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .known
+            .contains_key(&shadow.id());
+        self.copy = Some((shadow.id(), bytes, std::sync::Arc::downgrade(shadow)));
+        if fresh { bytes } else { 0 }
+    }
+}
+
+impl Drop for BufferWarmPermit<'_> {
+    fn drop(&mut self) {
+        let mut held = self.budget.lock().unwrap_or_else(|e| e.into_inner());
+        if held.frame == Some(self.frame) {
+            held.elapsed = held.elapsed.saturating_add(self.began.elapsed());
+            if let Some((id, bytes, copy)) = self.copy.take()
+                && held.known.insert(id, copy).is_none()
+            {
+                held.bytes = held.bytes.saturating_add(bytes);
+            }
+        }
+        held.last_served = self.heap;
+        held.busy = false;
+    }
+}
+
+fn buffer_record(heap: &crate::descriptor::Heap, index: u32) -> Option<[u32; 3]> {
+    let handle = heap.handle(index)?;
+    Some(unsafe { (handle as *const [u32; 3]).read_unaligned() })
+}
+
+struct BufferReapPass<'a>(&'a crate::descriptor::host::HostHeap);
+
+impl Drop for BufferReapPass<'_> {
+    fn drop(&mut self) {
+        self.0.buffer_ranges().reaping = false;
+    }
+}
+
+fn reap_buffer_ranges(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap) {
+    let epoch = crate::descriptor::release_epoch();
+    let started = std::time::Instant::now();
+    {
+        let mut cache = host.buffer_ranges();
+        if cache.last_reaped_epoch >= epoch || cache.reaping {
+            return;
+        }
+        cache.reaping = true;
+    }
+    let _reaping = BufferReapPass(host);
+    let (records, revision) = {
+        let cache = host.buffer_ranges();
+        let records = cache
+            .ranges
+            .iter()
+            .filter(|(_, range)| crate::descriptor::is_object_record(&range.3))
+            .map(|(&index, range)| (index, range.3))
+            .collect::<Vec<_>>();
+        (records, cache.object_revision)
+    };
+    let expired = crate::descriptor::expired_object_views(&records);
+    let before = crate::shadow::live_copy_bytes();
+    let mut invalidated = 0u64;
+    let mut gone = Vec::new();
+    for (index, expected) in expired {
+        if let Some(handle) = heap.handle(index)
+            && host.invalidate_released(index, expected, handle)
+        {
+            invalidated += 1;
+        }
+        let mut cache = host.buffer_ranges();
+        if cache
+            .ranges
+            .get(&index)
+            .is_some_and(|range| u64::from(range.3[2]) << 32 | u64::from(range.3[1]) == expected)
+            && let Some(range) = cache.ranges.remove(&index)
+        {
+            gone.push(range.0);
+        }
+    }
+    let stale_slots = gone.len() as u64;
+    let mut affected = std::collections::HashMap::new();
+    for shadow in &gone {
+        affected
+            .entry(shadow.id())
+            .or_insert_with(|| unsafe { shadow.buffer.GetDesc() }.Width);
+    }
+    let affected_bytes: u64 = affected.values().sum();
+    drop(gone);
+    let after = crate::shadow::live_copy_bytes();
+    let delta = if stale_slots != 0 || invalidated != 0 {
+        (i128::from(before) - i128::from(after)).clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+            as i64
+    } else {
+        0
+    };
+    let mut cache = host.buffer_ranges();
+    if cache.object_revision == revision {
+        cache.last_reaped_epoch = cache.last_reaped_epoch.max(epoch);
+    }
+    cache.reap_passes += 1;
+    cache.stale_slots += stale_slots;
+    cache.stale_host_slots += invalidated;
+    cache.stale_shadow_bytes = cache.stale_shadow_bytes.saturating_add(affected_bytes);
+    cache.reap_us = cache
+        .reap_us
+        .saturating_add(started.elapsed().as_micros() as u64);
+    cache.reap_sampled_live_change = delta;
+    cache.reap_live_before = before;
+    cache.reap_live_after = after;
+}
+
+fn log_buffer_warmup(host: &crate::descriptor::host::HostHeap) {
+    let Ok(mut cache) = host.buffer_ranges_try() else {
+        return;
+    };
+    let now = crate::host::now_ms();
+    if cache.logged_ms != 0 && now.saturating_sub(cache.logged_ms) < 5000 {
+        return;
+    }
+    cache.logged_ms = now.max(1);
+    tracing::info!(heap = host.id(), total = host.buffer_slot_count(), ready = cache.ranges.len(), pending = cache.work.pending(), retry = host.buffer_retry_due(u64::MAX).len(), scanning = cache.work.has_work(), cursor = ?cache.work.cursor(), scanned = cache.scanned, admitted_copy_mb = cache.admitted_bytes >> 20, warm_us = cache.warm_us, ready_refresh_us = cache.refresh_us, full_ready_batches = cache.full_ready_batches, cold_jobs = cache.cold_jobs, ready_bytes = cache.ready_bytes, ready_ranges = cache.ready_ranges, stale_slots = cache.stale_slots, stale_host_slots = cache.stale_host_slots, stale_shadow_bytes = cache.stale_shadow_bytes, reap_us = cache.reap_us, reap_passes = cache.reap_passes, reap_sampled_live_change = cache.reap_sampled_live_change, reap_live_before = cache.reap_live_before, reap_live_after = cache.reap_live_after, presented = crate::queue::presented(), "bindless buffer warmup progress");
+}
+
 pub(crate) const BAKE_PIXEL_SHADERS: [&str; 4] = [
     "c0a7fe77b1862e10",
     "0d1575a396dfe513",
@@ -1519,6 +1861,27 @@ impl State {
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
+        self.heap_buffers_at_frame(list, crate::frame::current())
+    }
+
+    fn heap_buffers_at_frame(&self, list: &HostList, frame: u64) -> Option<u64> {
+        self.heap_buffers_budgeted(
+            list,
+            frame,
+            crate::queue::presented(),
+            BufferWarmBudget::shared(),
+            *BufferWarmLimits::configured(),
+        )
+    }
+
+    fn heap_buffers_budgeted(
+        &self,
+        list: &HostList,
+        frame: u64,
+        presented: u64,
+        budget: &std::sync::Mutex<BufferWarmBudget>,
+        limits: BufferWarmLimits,
+    ) -> Option<u64> {
         let heap = self
             .heaps
             .iter()
@@ -1527,9 +1890,9 @@ impl State {
             .find(|h| !h.samplers())?;
         let host = heap.host()?;
         let gpu = host.strides_gpu()?;
-        // One key per list, as textures have: no title resource is there.
-        const ONCE: usize = usize::MAX - 0x5e;
-        if !list.first_use(ONCE) {
+        reap_buffer_ranges(heap, host);
+        if !list.first_heap_use(host.id()) {
+            log_buffer_warmup(host);
             return Some(gpu);
         }
         // The list may outlive the title's heap object, which owns the table.
@@ -1541,11 +1904,6 @@ impl State {
         // frame (2026-11-24, run 11).
         // shortcut: what the title writes into such buffers between lists
         // of one frame is seen a frame late.
-        static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-        let frame = crate::frame::current();
-        if FRAME.swap(frame, Ordering::Relaxed) == frame {
-            return Some(gpu);
-        }
         let started = std::time::Instant::now();
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Only the slots written since the
@@ -1553,54 +1911,130 @@ impl State {
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
-        type Ranges =
-            std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
-            std::sync::Mutex::new(None);
-        let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
-            .get_or_insert_with(Default::default)
-            .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
-        let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
-            host.buffer_slots()
-        } else {
-            changed
+        let mut changed = host.buffer_changes();
+        changed.extend(
+            host.buffer_retry_due(presented)
+                .into_iter()
+                .filter(|&index| {
+                    heap.handle(index)
+                        .and_then(crate::descriptor::view)
+                        .as_ref()
+                        .and_then(crate::descriptor::host::buffer_range)
+                        .is_some()
+                }),
+        );
+        let (fresh_ready, life) = {
+            let mut cache = host.buffer_ranges();
+            let fresh = cache.last_frame != Some(frame);
+            if fresh {
+                cache.last_frame = Some(frame);
+                if cache.passes.is_multiple_of(16) {
+                    cache.work.scan();
+                }
+                cache.passes += 1;
+            }
+            let fresh_ready = cache
+                .last_ready_presented
+                .is_none_or(|last| presented > last);
+            if fresh_ready {
+                cache.last_ready_presented = Some(presented);
+                cache.full_ready_batches += 1;
+            }
+            for index in changed {
+                if cache
+                    .ranges
+                    .get(&index)
+                    .is_some_and(|range| buffer_record(heap, index) != Some(range.3))
+                {
+                    cache.ranges.remove(&index);
+                }
+                cache.work.enqueue(index);
+            }
+            (fresh_ready, cache.life.clone())
         };
-        *passes += 1;
+        let warming = std::time::Instant::now();
+        let mut scanned = 0u64;
+        let mut admitted_bytes = 0u64;
+        let mut cold_jobs = 0u64;
+        let mut newly_ready = Vec::new();
+        let mut new_slots = std::collections::HashSet::new();
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive =
             !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
-        for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
+        loop {
+            if !host.buffer_ranges().work.has_work() {
+                budget
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .forget(host.id());
+                break;
+            }
+            let Some(mut permit) =
+                BufferWarmBudget::begin(budget, host.id(), &life, presented, limits)
+            else {
+                break;
+            };
+            let index = host
+                .buffer_ranges()
+                .work
+                .next(|cursor| host.buffer_slot_after(cursor));
+            let Some(index) = index else {
+                budget
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .forget(host.id());
+                break;
+            };
+            scanned += 1;
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            let Some(record) = buffer_record(heap, index) else {
                 continue;
             };
+            let current = crate::descriptor::view(handle);
+            if current.is_none() {
+                host.mirror_at_present(index, handle, true, presented);
+                host.buffer_ranges().ranges.remove(&index);
+                continue;
+            }
+            if current
+                .as_ref()
+                .and_then(crate::descriptor::host::buffer_range)
+                .is_none()
+            {
+                host.buffer_ranges().ranges.remove(&index);
+                continue;
+            }
+            if host
+                .buffer_ranges()
+                .ranges
+                .get(&index)
+                .is_some_and(|range| range.3 == record)
+                && host.buffer_slot_ready(index)
+            {
+                continue;
+            }
+            cold_jobs += 1;
+            let Some(view) = host.mirror_at_present(index, handle, true, presented) else {
+                continue;
+            };
+            if host.buffer_retry_pending(index) || !host.buffer_slot_ready(index) {
+                continue;
+            }
             // Every 64 views while the device lives (a cheap query).
             if alive
-                && n % 64 == 63
+                && scanned.is_multiple_of(64)
                 && let Some(why) = crate::descriptor::host::device_removed()
             {
                 alive = false;
                 GONE.store(true, Ordering::Relaxed);
-                let last: Vec<String> = slots[n - 63..=n]
-                    .iter()
-                    .filter_map(|&i| {
-                        crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}"))
-                    })
-                    .map(|s| s.chars().take(200).collect())
-                    .collect();
                 tracing::error!(
                     why,
                     slot = index,
-                    "the host device went while buffer views of the heap were made; one of: {last:#?}"
+                    "the host device went while buffer views of the heap were made"
                 );
                 crate::host::log_removal_context();
             }
@@ -1613,24 +2047,53 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            admitted_bytes = admitted_bytes.saturating_add(permit.copied(&shadow));
+            let mut cache = host.buffer_ranges();
+            if buffer_record(heap, index) != Some(record) {
+                cache.ranges.remove(&index);
+                cache.work.enqueue(index);
+                continue;
+            }
+            cache
+                .ranges
+                .insert(index, (shadow.clone(), address, address + len, record));
+            if crate::descriptor::is_object_record(&record) {
+                cache.object_revision = cache.object_revision.wrapping_add(1);
+                cache.last_reaped_epoch = 0;
+            }
+            new_slots.insert(index);
+            newly_ready.push((shadow, address, address + len));
         }
-        let views = ranges.len() as u32;
+        let refreshing = std::time::Instant::now();
+        let mut kept = host.buffer_ranges();
+        kept.scanned += scanned;
+        kept.cold_jobs += cold_jobs;
+        kept.warm_us = kept
+            .warm_us
+            .saturating_add(warming.elapsed().as_micros() as u64);
+        kept.admitted_bytes = kept.admitted_bytes.saturating_add(admitted_bytes);
+        let views = kept.ranges.len() as u32;
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<
             usize,
             (std::sync::Arc<crate::shadow::Shadow>, u64, u64),
         > = std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
+        let mut note = |shadow: &std::sync::Arc<crate::shadow::Shadow>, from: u64, to: u64| {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
             let span = spans
                 .entry(key)
-                .or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
+                .or_insert_with(|| (shadow.clone(), from, to));
+            span.1 = span.1.min(from);
+            span.2 = span.2.max(to);
+        };
+        if fresh_ready {
+            for (index, (shadow, from, to, _)) in &kept.ranges {
+                if !new_slots.contains(index) {
+                    note(shadow, *from, *to);
+                }
+            }
         }
         drop(kept);
-        let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1638,31 +2101,57 @@ impl State {
         // the garbage ended runs (the card stopped answering 14-90 frames
         // into the opening cutscene; with every frame it ran on). The pass
         // costs some 30 ms a frame this way.
-        static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> =
-            std::sync::Mutex::new(None);
-        let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
-        let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
-            if shadow.unwatched() {
-                // By the copy's number: a copy made where one let go was
-                // (`shadow::let_go_idle`) has never been refreshed.
-                let key = shadow.id() as usize;
-                // `VICTORY_UNWATCHED_FRAMES` sets the interval (1: every frame).
-                static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-                let every = *EVERY.get_or_init(|| {
-                    std::env::var("VICTORY_UNWATCHED_FRAMES")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(1)
-                });
-                match whole.get(&key) {
-                    Some(&last) if frame < last + every => continue,
-                    _ => {
-                        whole.insert(key, frame);
+        let mut planned = spans
+            .values()
+            .map(|(shadow, from, to)| (shadow.clone(), *from, *to, true))
+            .collect::<Vec<_>>();
+        planned.extend(
+            newly_ready
+                .into_iter()
+                .map(|(shadow, from, to)| (shadow, from, to, false)),
+        );
+        let ready_copies = planned
+            .iter()
+            .map(|(shadow, _, _, _)| shadow.id())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let mut refreshes = Vec::new();
+        let recording = list.buffer_recording_id();
+        {
+            let mut coverage = budget.lock().unwrap_or_else(|e| e.into_inner());
+            for (shadow, from, to, full) in planned {
+                let ranges = if shadow.unwatched() {
+                    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                    let interval = *EVERY.get_or_init(|| {
+                        std::env::var("VICTORY_UNWATCHED_FRAMES")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(1)
+                    });
+                    if full && !coverage.ready.allow_full(&shadow, presented, interval) {
+                        continue;
                     }
+                    coverage
+                        .ready
+                        .claim(recording, shadow.id(), presented, from, to)
+                } else {
+                    vec![(from, to)]
+                };
+                for (from, to) in ranges {
+                    refreshes.push((shadow.clone(), from, to));
                 }
             }
-            shadow.refresh(list, *from, to - from);
+        }
+        let ready_bytes: u64 = refreshes.iter().map(|(_, from, to)| to - from).sum();
+        let ready_ranges = refreshes.len() as u64;
+        for (shadow, from, to) in refreshes {
+            shadow.refresh(list, from, to - from);
+        }
+        {
+            let mut cache = host.buffer_ranges();
+            cache.refresh_us += refreshing.elapsed().as_micros() as u64;
+            cache.ready_bytes = cache.ready_bytes.saturating_add(ready_bytes);
+            cache.ready_ranges += ready_ranges;
         }
         self.heap_textures(list, heap, host);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
@@ -1673,14 +2162,15 @@ impl State {
         if u64::from(views) > seen + seen / 2 {
             LOGGED.store(u64::from(views), Ordering::Relaxed);
             tracing::info!(
-                slots = slots.len(),
+                slots = scanned,
                 views,
-                copies = spans.len(),
-                mb = bytes >> 20,
+                copies = ready_copies,
+                mb = ready_bytes >> 20,
                 ms = started.elapsed().as_millis(),
                 "buffer views of the heap made ready for shaders that pick them by index"
             );
         }
+        log_buffer_warmup(host);
         Some(gpu)
     }
 
@@ -2721,6 +3211,7 @@ impl State {
                     && (offset - w.base) / u64::from(w.step) < u64::from(w.records)
             })
             .map(|w| (w.scratch.clone(), offset - w.base));
+        let reused = hit.is_some();
         let (bounded, at) = match hit {
             Some(hit) => hit,
             None => {
@@ -2810,7 +3301,9 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            if !reused {
+                crate::indirect::done(list, &bounded);
+            }
             why("prepare failed");
             return false;
         }
@@ -3100,6 +3593,891 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 mod tests {
     use super::*;
 
+    fn buffer_test_limits() -> BufferWarmLimits {
+        BufferWarmLimits {
+            span: std::time::Duration::from_secs(60),
+            bytes: u64::MAX,
+        }
+    }
+
+    fn buffer_test_write(memory: &crate::resource::Memory, offset: usize, len: usize, value: u8) {
+        let address = memory.address() as usize + offset;
+        crate::watch::writing(address, len);
+        unsafe { std::ptr::write_bytes(address as *mut u8, value, len) };
+        crate::watch::wrote(address, len);
+    }
+
+    fn buffer_test_byte(shadow: &crate::shadow::Shadow, offset: usize) -> u8 {
+        let mut mapped = std::ptr::null_mut();
+        unsafe {
+            shadow.buffer.Map(0, None, Some(&mut mapped)).unwrap();
+            let value = *(mapped as *const u8).add(offset);
+            shadow.buffer.Unmap(0, None);
+            value
+        }
+    }
+
+    #[test]
+    fn buffer_ready_coverage_matches_a_byte_oracle_and_resets_on_present() {
+        let mut coverage = BufferReadyCoverage::default();
+        let mut bytes = [false; 128];
+        let mut seed = 0x917b_2841u32;
+        for _ in 0..2048 {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let a = seed as usize % 129;
+            let b = (seed >> 16) as usize % 129;
+            let (from, to) = (a.min(b), a.max(b));
+            let mut expected = Vec::new();
+            let mut at = from;
+            while at < to {
+                if bytes[at] {
+                    at += 1;
+                    continue;
+                }
+                let first = at;
+                while at < to && !bytes[at] {
+                    at += 1;
+                }
+                expected.push((first as u64, at as u64));
+            }
+            assert_eq!(coverage.claim(1, 1, 10, from as u64, to as u64), expected);
+            bytes[from..to].fill(true);
+        }
+        assert_eq!(coverage.claim(1, 2, 10, 0, 128), [(0, 128)]);
+        assert_eq!(coverage.claim(2, 1, 10, 0, 128), [(0, 128)]);
+        assert_eq!(coverage.claim(1, 1, 11, 0, 128), [(0, 128)]);
+        assert_eq!(coverage.claim(1, 1, 9, 0, 128), [(0, 128)]);
+        assert!(coverage.claim(1, 1, 11, 0, 128).is_empty());
+    }
+
+    #[test]
+    fn buffer_warm_cursor_survives_rescans_and_changed_slot_backlogs() {
+        let mut work = crate::descriptor::host::BufferWork::default();
+        let slots: std::collections::BTreeSet<_> = (0..1000u32).collect();
+        let after = |cursor| {
+            use std::ops::Bound::{Excluded, Unbounded};
+            match cursor {
+                Some(index) => slots.range((Excluded(index), Unbounded)).next().copied(),
+                None => slots.first().copied(),
+            }
+        };
+        work.scan();
+        for index in 0..10 {
+            assert_eq!(work.next(after), Some(index));
+        }
+        assert_eq!(work.cursor(), Some(9));
+        work.enqueue(3);
+        work.enqueue(3);
+        assert_eq!(work.pending(), 1);
+        work.scan();
+        assert_eq!(work.cursor(), Some(9));
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..3000 {
+            let Some(index) = work.next(after) else { break };
+            seen.insert(index);
+        }
+        assert_eq!(seen, slots);
+        assert!(!work.has_work());
+    }
+
+    #[test]
+    fn buffer_warm_budget_shares_atomic_overruns_and_rotates_heap_priority() {
+        let budget = std::sync::Mutex::new(BufferWarmBudget::default());
+        let a = std::sync::Arc::new(());
+        let b = std::sync::Arc::new(());
+        let limits = BufferWarmLimits {
+            span: std::time::Duration::from_millis(1),
+            bytes: u64::MAX,
+        };
+        for frame in 0..8 {
+            let first = if frame % 2 == 0 { 10 } else { 20 };
+            let mut served = Vec::new();
+            for (heap, life) in [(10, &a), (20, &b)] {
+                if let Some(mut permit) =
+                    BufferWarmBudget::begin(&budget, heap, life, frame, limits)
+                {
+                    permit.began = std::time::Instant::now() - std::time::Duration::from_millis(2);
+                    served.push(heap);
+                }
+            }
+            assert_eq!(served, [first], "frame {frame}");
+            assert!(budget.lock().unwrap().elapsed >= limits.span);
+        }
+        drop(b);
+        assert!(BufferWarmBudget::begin(&budget, 10, &a, 8, limits).is_some());
+    }
+
+    #[test]
+    fn buffer_warm_budget_allows_only_one_concurrent_atomic_job() {
+        let budget = std::sync::Mutex::new(BufferWarmBudget::default());
+        let life = std::sync::Arc::new(());
+        let barrier = std::sync::Barrier::new(8);
+        let granted = std::thread::scope(|scope| {
+            let jobs: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let permit =
+                            BufferWarmBudget::begin(&budget, 1, &life, 0, buffer_test_limits());
+                        let granted = permit.is_some();
+                        barrier.wait();
+                        drop(permit);
+                        granted
+                    })
+                })
+                .collect();
+            jobs.into_iter()
+                .map(|job| usize::from(job.join().unwrap()))
+                .sum::<usize>()
+        });
+        assert_eq!(granted, 1);
+    }
+
+    struct TestBindlessHeap {
+        object: This,
+        address: u64,
+        resource: usize,
+        shadow: std::sync::Arc<crate::shadow::Shadow>,
+    }
+
+    impl TestBindlessHeap {
+        fn new(address: u64, resource: usize) -> Self {
+            Self::with_slots(address, resource, 1)
+        }
+
+        fn with_slots(address: u64, resource: usize, count: u32) -> Self {
+            let desc = [0u32, count, 1, 0, 0, 0, 0, 0];
+            let iid = crate::object::guid(
+                0x8efb471d,
+                0x616c,
+                0x4f49,
+                [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+            );
+            let mut object = std::ptr::null();
+            assert_eq!(
+                crate::descriptor::create_heap(
+                    std::ptr::null(),
+                    desc.as_ptr().cast(),
+                    &iid,
+                    &mut object,
+                ),
+                crate::object::S_OK,
+            );
+            crate::shadow::register(resource, address, 65536);
+            let shadow = crate::shadow::find(address, 65536).expect("registered buffer copy");
+            let heap = Self {
+                object,
+                address,
+                resource,
+                shadow,
+            };
+            let buffer = [1u32, 0, 0, 0, 65536, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            let mut view = [0u32; 16];
+            view[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS.0 as u32;
+            view[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+            view[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            view[6] = 64;
+            view[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+            view[10] = address as u32;
+            view[11] = (address >> 32) as u32;
+            crate::descriptor::create_placed_srv(
+                std::ptr::null(),
+                &buffer,
+                &view,
+                crate::descriptor::heap(object).handle(0).unwrap(),
+            );
+            heap
+        }
+
+        fn host(&self) -> &crate::descriptor::host::HostHeap {
+            crate::descriptor::heap(self.object)
+                .host()
+                .expect("shader-visible host heap")
+        }
+
+        fn rewrite_buffer(&self, address: u64) {
+            self.rewrite_buffer_slot(0, address, 0);
+        }
+
+        fn rewrite_buffer_slot(&self, index: u32, address: u64, first_element: u32) {
+            let buffer = [1u32, 0, 0, 0, 65536, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            let mut view = [0u32; 16];
+            view[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS.0 as u32;
+            view[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+            view[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            view[4] = first_element;
+            view[6] = 64;
+            view[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+            view[10] = address as u32;
+            view[11] = (address >> 32) as u32;
+            crate::descriptor::create_placed_srv(
+                std::ptr::null(),
+                &buffer,
+                &view,
+                crate::descriptor::heap(self.object).handle(index).unwrap(),
+            );
+        }
+    }
+
+    impl Drop for TestBindlessHeap {
+        fn drop(&mut self) {
+            crate::shadow::unregister(self.resource, self.address);
+            crate::object::slot::<extern "system" fn(This) -> u32>(self.object, 0x10)(self.object);
+        }
+    }
+
+    struct TestObjectBuffer(This);
+
+    impl TestObjectBuffer {
+        fn at(address: u64) -> Self {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 65536,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let iid = crate::object::guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            );
+            let mut object = std::ptr::null();
+            assert_eq!(
+                crate::resource::create_at_address(
+                    std::ptr::null(),
+                    address,
+                    std::ptr::from_ref(&desc).cast(),
+                    0,
+                    std::ptr::null(),
+                    &iid,
+                    &mut object
+                ),
+                crate::object::S_OK
+            );
+            Self(object)
+        }
+
+        fn release(&mut self) {
+            if !self.0.is_null() {
+                crate::object::slot::<extern "system" fn(This) -> u32>(self.0, 0x10)(self.0);
+                self.0 = std::ptr::null();
+            }
+        }
+    }
+
+    impl Drop for TestObjectBuffer {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn buffer_test_object_view(heap: &TestBindlessHeap, index: u32, resource: &TestObjectBuffer) {
+        let mut view = [0u32; 10];
+        view[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS.0 as u32;
+        view[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        view[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view[6] = 64;
+        view[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+        crate::descriptor::create_srv(
+            std::ptr::null(),
+            resource.0,
+            &view,
+            crate::descriptor::heap(heap.object).handle(index).unwrap(),
+        );
+    }
+
+    #[test]
+    fn buffer_ready_release_reap_frees_stale_refs_with_no_cold_budget_and_keeps_live_owners() {
+        let accounting = crate::shadow::TestCopyBudget::new(8 * 65536);
+        let old_memory = crate::resource::Memory::zeroed(65536, 65536).unwrap();
+        let live_memory = crate::resource::Memory::zeroed(65536, 65536).unwrap();
+        let list_memory = crate::resource::Memory::zeroed(65536, 65536).unwrap();
+        let solo_memory = crate::resource::Memory::zeroed(65536, 65536).unwrap();
+        let new_memory = crate::resource::Memory::zeroed(65536, 65536).unwrap();
+        let mut old = TestObjectBuffer::at(old_memory.address());
+        let live = TestObjectBuffer::at(live_memory.address());
+        let mut list_owned = TestObjectBuffer::at(list_memory.address());
+        let mut solo = TestObjectBuffer::at(solo_memory.address());
+        let new_generation = TestObjectBuffer::at(new_memory.address());
+        let heap = TestBindlessHeap::with_slots(0x7edb_6100_0000, usize::MAX - 0x6f30, 7);
+        buffer_test_object_view(&heap, 1, &old);
+        heap.rewrite_buffer_slot(2, old_memory.address(), 64);
+        buffer_test_object_view(&heap, 3, &live);
+        buffer_test_object_view(&heap, 4, &old);
+        buffer_test_object_view(&heap, 5, &list_owned);
+        buffer_test_object_view(&heap, 6, &solo);
+        let host = crate::host::host().unwrap();
+        let budget = std::sync::Mutex::new(BufferWarmBudget::default());
+        let mut state = State::default();
+        state.set_heaps(&[heap.object]);
+        let first = host.new_list().unwrap();
+        state
+            .heap_buffers_budgeted(&first, 1, 200, &budget, buffer_test_limits())
+            .unwrap();
+        assert_eq!(heap.host().buffer_ranges().ranges.len(), 7);
+        let keep = host.new_list().unwrap();
+        let (old_weak, list_weak, solo_weak) = {
+            let cache = heap.host().buffer_ranges();
+            assert!(std::sync::Arc::ptr_eq(
+                &cache.ranges[&1].0,
+                &cache.ranges[&2].0
+            ));
+            cache.ranges[&5]
+                .0
+                .refresh(&keep, list_memory.address(), 256);
+            (
+                std::sync::Arc::downgrade(&cache.ranges[&1].0),
+                std::sync::Arc::downgrade(&cache.ranges[&5].0),
+                std::sync::Arc::downgrade(&cache.ranges[&6].0),
+            )
+        };
+        first.close();
+        first.reset();
+        old.release();
+        list_owned.release();
+        solo.release();
+        buffer_test_object_view(&heap, 4, &new_generation);
+        let handle = crate::descriptor::heap(heap.object).handle(4).unwrap();
+        heap.host().mirror_at_present(4, handle, true, 201).unwrap();
+        let new_shadow = crate::shadow::find_for_view(new_memory.address(), 65536).unwrap();
+        let references = crate::host::references(&new_shadow.buffer);
+        let before = accounting.used();
+        let blocked = host.new_list().unwrap();
+        state
+            .heap_buffers_budgeted(
+                &blocked,
+                2,
+                201,
+                &budget,
+                BufferWarmLimits {
+                    span: std::time::Duration::ZERO,
+                    bytes: 0,
+                },
+            )
+            .unwrap();
+        {
+            let cache = heap.host().buffer_ranges();
+            assert_eq!(cache.stale_slots, 4);
+            assert_eq!(cache.stale_host_slots, 3);
+            assert_eq!(cache.stale_shadow_bytes, 3 * 65536);
+            for index in [0, 2, 3] {
+                assert!(cache.ranges.contains_key(&index));
+            }
+            for index in [1, 4, 5, 6] {
+                assert!(!cache.ranges.contains_key(&index));
+            }
+        }
+        assert!(!heap.host().buffer_slot_ready(1));
+        assert!(heap.host().buffer_slot_ready(2));
+        assert!(heap.host().buffer_slot_ready(3));
+        assert!(heap.host().buffer_slot_ready(4));
+        assert!(!heap.host().buffer_slot_ready(5));
+        assert!(!heap.host().buffer_slot_ready(6));
+        assert_eq!(crate::host::references(&new_shadow.buffer), references);
+        assert!(old_weak.upgrade().is_some());
+        assert!(list_weak.upgrade().is_some());
+        assert!(solo_weak.upgrade().is_none());
+        assert_eq!(accounting.used(), before - 65536);
+        keep.close();
+        keep.reset();
+        assert!(list_weak.upgrade().is_none());
+        assert_eq!(accounting.used(), before - 2 * 65536);
+        assert!(old_weak.upgrade().is_some());
+    }
+
+    #[test]
+    fn buffer_ready_release_reap_skips_an_epoch_already_claimed_by_another_recorder() {
+        let memory = crate::resource::Memory::zeroed(65536, 65536).unwrap();
+        let mut object = TestObjectBuffer::at(memory.address());
+        let heap = TestBindlessHeap::with_slots(0x7edb_6200_0000, usize::MAX - 0x6f31, 2);
+        buffer_test_object_view(&heap, 1, &object);
+        let host = crate::host::host().unwrap();
+        let list = host.new_list().unwrap();
+        let budget = std::sync::Mutex::new(BufferWarmBudget::default());
+        let mut state = State::default();
+        state.set_heaps(&[heap.object]);
+        state
+            .heap_buffers_budgeted(&list, 1, 300, &budget, buffer_test_limits())
+            .unwrap();
+        list.close();
+        list.reset();
+        object.release();
+        let title_heap = crate::descriptor::heap(heap.object);
+        let passes = heap.host().buffer_ranges().reap_passes;
+        heap.host().buffer_ranges().reaping = true;
+        let heap_address = heap.object as usize;
+        std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let title = crate::descriptor::heap(heap_address as This);
+                        reap_buffer_ranges(title, title.host().unwrap());
+                    })
+                })
+                .collect();
+            for thread in threads {
+                thread.join().unwrap();
+            }
+        });
+        assert_eq!(heap.host().buffer_ranges().reap_passes, passes);
+        assert!(heap.host().buffer_ranges().ranges.contains_key(&1));
+        {
+            let _pass = BufferReapPass(heap.host());
+        }
+        assert!(!heap.host().buffer_ranges().reaping);
+        reap_buffer_ranges(title_heap, heap.host());
+        assert_eq!(heap.host().buffer_ranges().reap_passes, passes + 1);
+        assert!(!heap.host().buffer_ranges().ranges.contains_key(&1));
+        reap_buffer_ranges(title_heap, heap.host());
+        assert_eq!(heap.host().buffer_ranges().reap_passes, passes + 1);
+    }
+
+    #[test]
+    fn buffer_ready_batches_follow_present_and_targeted_refresh_remains_immediate() {
+        let memory = crate::resource::Memory::zeroed(65536, 65536).unwrap();
+        buffer_test_write(&memory, 0, 256, 0x11);
+        let heap = TestBindlessHeap::new(memory.address(), usize::MAX - 0x6f20);
+        heap.shadow.update(memory.address() as usize, 256);
+        assert!(heap.shadow.unwatched());
+        let host = crate::host::host().unwrap();
+        let budget = std::sync::Mutex::new(BufferWarmBudget::default());
+        let blocked = BufferWarmLimits {
+            span: std::time::Duration::ZERO,
+            bytes: 0,
+        };
+        let mut state = State::default();
+        state.set_heaps(&[heap.object]);
+        let first = host.new_list().unwrap();
+        state
+            .heap_buffers_budgeted(&first, 1, 100, &budget, buffer_test_limits())
+            .unwrap();
+        first.close();
+        host.execute(&[&first]);
+        assert_eq!(buffer_test_byte(&heap.shadow, 0), 0x11);
+        assert_eq!(heap.host().buffer_ranges().full_ready_batches, 1);
+        assert_eq!(heap.host().buffer_ranges().ready_bytes, 256);
+        buffer_test_write(&memory, 0, 256, 0xa7);
+        let same = host.new_list().unwrap();
+        state
+            .heap_buffers_budgeted(&same, 2, 100, &budget, blocked)
+            .unwrap();
+        same.close();
+        host.execute(&[&same]);
+        assert_eq!(heap.host().buffer_ranges().full_ready_batches, 1);
+        assert_eq!(heap.host().buffer_ranges().ready_bytes, 256);
+        assert_eq!(buffer_test_byte(&heap.shadow, 0), 0x11);
+        let next = host.new_list().unwrap();
+        state
+            .heap_buffers_budgeted(&next, 3, 101, &budget, blocked)
+            .unwrap();
+        next.close();
+        host.execute(&[&next]);
+        assert_eq!(heap.host().buffer_ranges().full_ready_batches, 2);
+        assert_eq!(heap.host().buffer_ranges().ready_bytes, 512);
+        assert_eq!(buffer_test_byte(&heap.shadow, 0), 0xa7);
+        buffer_test_write(&memory, 0, 256, 0xc3);
+        let targeted = host.new_list().unwrap();
+        let handle = crate::descriptor::heap(heap.object).handle(0).unwrap();
+        let view = heap.host().mirror_at_present(0, handle, true, 101).unwrap();
+        let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view).unwrap();
+        shadow.refresh(&targeted, address, len);
+        state
+            .heap_buffers_budgeted(&targeted, 4, 101, &budget, blocked)
+            .unwrap();
+        targeted.close();
+        host.execute(&[&targeted]);
+        assert_eq!(buffer_test_byte(&heap.shadow, 0), 0xc3);
+        assert_eq!(heap.host().buffer_ranges().full_ready_batches, 2);
+        assert_eq!(heap.host().buffer_ranges().ready_bytes, 512);
+    }
+
+    #[test]
+    fn buffer_ready_coverage_is_shared_by_heaps_and_copies_only_new_subranges() {
+        let memory = crate::resource::Memory::zeroed(65536, 65536).unwrap();
+        buffer_test_write(&memory, 0, 768, 0x11);
+        let a = TestBindlessHeap::new(memory.address(), usize::MAX - 0x6f21);
+        let b = TestBindlessHeap::with_slots(memory.address(), usize::MAX - 0x6f22, 2);
+        assert!(std::sync::Arc::ptr_eq(&a.shadow, &b.shadow));
+        a.shadow.update(memory.address() as usize, 256);
+        assert!(a.shadow.unwatched());
+        b.rewrite_buffer_slot(0, memory.address(), 32);
+        b.rewrite_buffer_slot(1, memory.address(), 128);
+        let host = crate::host::host().unwrap();
+        let budget = std::sync::Mutex::new(BufferWarmBudget::default());
+        let mut state = State::default();
+        state.set_heaps(&[a.object]);
+        let first = host.new_list().unwrap();
+        state
+            .heap_buffers_budgeted(&first, 1, 100, &budget, buffer_test_limits())
+            .unwrap();
+        buffer_test_write(&memory, 128, 256, 0xa7);
+        buffer_test_write(&memory, 512, 256, 0xc3);
+        state.set_heaps(&[b.object]);
+        state
+            .heap_buffers_budgeted(&first, 2, 100, &budget, buffer_test_limits())
+            .unwrap();
+        first.close();
+        host.execute(&[&first]);
+        assert_eq!(a.host().buffer_ranges().ready_bytes, 256);
+        assert_eq!(b.host().buffer_ranges().full_ready_batches, 1);
+        assert_eq!(b.host().buffer_ranges().ready_bytes, 384);
+        assert_eq!(b.host().buffer_ranges().ready_ranges, 2);
+        assert_eq!(buffer_test_byte(&a.shadow, 128), 0xa7);
+        assert_eq!(buffer_test_byte(&a.shadow, 256), 0xa7);
+        assert_eq!(buffer_test_byte(&a.shadow, 512), 0xc3);
+        let mut coverage = BufferReadyCoverage::default();
+        assert!(coverage.allow_full(&a.shadow, 10, 3));
+        assert!(coverage.allow_full(&a.shadow, 10, 3));
+        assert!(!coverage.allow_full(&a.shadow, 11, 3));
+        assert_eq!(
+            coverage.claim(1, a.shadow.id(), 11, 1024, 1280),
+            [(1024, 1280)]
+        );
+        assert!(coverage.allow_full(&a.shadow, 13, 3));
+    }
+
+    #[test]
+    fn buffer_ready_independent_new_alias_refreshes_when_the_first_list_never_executes() {
+        let memory = crate::resource::Memory::zeroed(65536, 65536).unwrap();
+        buffer_test_write(&memory, 0, 256, 0x11);
+        let a = TestBindlessHeap::new(memory.address(), usize::MAX - 0x6f23);
+        let b = TestBindlessHeap::new(memory.address(), usize::MAX - 0x6f24);
+        assert!(std::sync::Arc::ptr_eq(&a.shadow, &b.shadow));
+        a.shadow.update(memory.address() as usize, 256);
+        assert!(a.shadow.unwatched());
+        let host = crate::host::host().unwrap();
+        let budget = std::sync::Mutex::new(BufferWarmBudget::default());
+        let first = host.new_list().unwrap();
+        let second = host.new_list().unwrap();
+        let mut state = State::default();
+        buffer_test_write(&memory, 0, 256, 0xa7);
+        state.set_heaps(&[a.object]);
+        state
+            .heap_buffers_budgeted(&first, 1, 100, &budget, buffer_test_limits())
+            .unwrap();
+        state.set_heaps(&[b.object]);
+        state
+            .heap_buffers_budgeted(&second, 2, 100, &budget, buffer_test_limits())
+            .unwrap();
+        assert_ne!(first.buffer_recording_id(), second.buffer_recording_id());
+        assert_eq!(buffer_test_byte(&a.shadow, 0), 0x11);
+        second.close();
+        host.execute(&[&second]);
+        assert_eq!(buffer_test_byte(&a.shadow, 0), 0xa7);
+        assert_eq!(b.host().buffer_ranges().ready_bytes, 256);
+        let old_recording = first.buffer_recording_id();
+        first.close();
+        first.reset();
+        assert_ne!(first.buffer_recording_id(), old_recording);
+        let c = TestBindlessHeap::new(memory.address(), usize::MAX - 0x6f25);
+        assert!(std::sync::Arc::ptr_eq(&a.shadow, &c.shadow));
+        buffer_test_write(&memory, 0, 256, 0xc3);
+        state.set_heaps(&[c.object]);
+        state
+            .heap_buffers_budgeted(&first, 3, 100, &budget, buffer_test_limits())
+            .unwrap();
+        assert_eq!(c.host().buffer_ranges().ready_bytes, 256);
+        first.close();
+        host.execute(&[&first]);
+        assert_eq!(buffer_test_byte(&a.shadow, 0), 0xc3);
+    }
+
+    #[test]
+    fn buffer_warm_byte_budget_counts_unique_real_copies_and_one_oversized_job() {
+        let a = TestBindlessHeap::new(0x7edb_5100_0000, usize::MAX - 0x6ef4);
+        let b = TestBindlessHeap::new(0x7edb_5101_0000, usize::MAX - 0x6ef5);
+        let budget = std::sync::Mutex::new(BufferWarmBudget::default());
+        let life = std::sync::Arc::new(());
+        let limits = BufferWarmLimits {
+            span: std::time::Duration::from_secs(60),
+            bytes: 2 * 65536,
+        };
+        for (shadow, expected) in [(&a.shadow, 65536), (&a.shadow, 0), (&b.shadow, 65536)] {
+            let mut permit = BufferWarmBudget::begin(&budget, 1, &life, 0, limits).unwrap();
+            assert_eq!(permit.copied(shadow), expected);
+        }
+        assert_eq!(budget.lock().unwrap().bytes, 2 * 65536);
+        assert!(BufferWarmBudget::begin(&budget, 1, &life, 0, limits).is_none());
+        let oversized = std::sync::Mutex::new(BufferWarmBudget::default());
+        let limits = BufferWarmLimits { bytes: 1, ..limits };
+        {
+            let mut permit = BufferWarmBudget::begin(&oversized, 1, &life, 0, limits).unwrap();
+            permit.copied(&a.shadow);
+        }
+        assert!(BufferWarmBudget::begin(&oversized, 1, &life, 0, limits).is_none());
+    }
+
+    #[test]
+    fn buffer_warm_pending_heap_does_not_stop_ready_buffer_refresh_or_targeted_views() {
+        let memory = crate::resource::Memory::zeroed(65536, 65536).unwrap();
+        let a = TestBindlessHeap::new(memory.address(), usize::MAX - 0x6ef6);
+        let b = TestBindlessHeap::new(0x7edb_5201_0000, usize::MAX - 0x6ef7);
+        let host = crate::host::host().unwrap();
+        let budget = std::sync::Mutex::new(BufferWarmBudget::default());
+        let first = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[a.object]);
+        state
+            .heap_buffers_budgeted(&first, 1, 1, &budget, buffer_test_limits())
+            .unwrap();
+        first.close();
+        host.execute(&[&first]);
+        let blocked = BufferWarmLimits {
+            span: std::time::Duration::ZERO,
+            bytes: 0,
+        };
+        let second = host.new_list().unwrap();
+        crate::watch::writing(memory.address() as usize, 256);
+        unsafe { std::ptr::write_bytes(memory.address() as *mut u8, 0xa7, 256) };
+        crate::watch::wrote(memory.address() as usize, 256);
+        state
+            .heap_buffers_budgeted(&second, 2, 2, &budget, blocked)
+            .unwrap();
+        state.set_heaps(&[b.object]);
+        state
+            .heap_buffers_budgeted(&second, 2, 2, &budget, blocked)
+            .unwrap();
+        assert_eq!(a.host().buffer_ranges().ranges.len(), 1);
+        assert!(b.host().buffer_ranges().ranges.is_empty());
+        assert!(b.host().buffer_ranges().work.has_work());
+        let before = crate::host::references(&b.shadow.buffer);
+        b.host()
+            .mirror_at_present(
+                0,
+                crate::descriptor::heap(b.object).handle(0).unwrap(),
+                true,
+                2,
+            )
+            .unwrap();
+        assert_eq!(crate::host::references(&b.shadow.buffer), before + 1);
+        second.close();
+        host.execute(&[&second]);
+        let mut mapped = std::ptr::null_mut();
+        unsafe {
+            a.shadow.buffer.Map(0, None, Some(&mut mapped)).unwrap();
+            assert_eq!(*(mapped as *const u8), 0xa7);
+            a.shadow.buffer.Unmap(0, None);
+        }
+    }
+
+    #[test]
+    fn buffer_warm_budget_retry_survives_rescan_and_recovers_on_next_present() {
+        let heap = TestBindlessHeap::new(0x7edb_5300_0000, usize::MAX - 0x6ef8);
+        const NEW: u64 = 0x7edb_5301_0000;
+        const RESOURCE: usize = usize::MAX - 0x6ef9;
+        let admission = crate::shadow::TestCopyBudget::new(65536);
+        const FILLER: u64 = 0x7edb_5302_0000;
+        const FILLER_RESOURCE: usize = usize::MAX - 0x6efa;
+        crate::shadow::register(FILLER_RESOURCE, FILLER, 65536);
+        let filler = crate::shadow::find(FILLER, 65536).unwrap();
+        assert_eq!(admission.used(), 65536);
+        crate::shadow::register(RESOURCE, NEW, 65536);
+        heap.rewrite_buffer(NEW);
+        let host = crate::host::host().unwrap();
+        let budget = std::sync::Mutex::new(BufferWarmBudget::default());
+        let mut state = State::default();
+        state.set_heaps(&[heap.object]);
+        let first = host.new_list().unwrap();
+        state
+            .heap_buffers_budgeted(&first, 10, 10, &budget, buffer_test_limits())
+            .unwrap();
+        assert!(heap.host().buffer_retry_pending(0));
+        assert!(heap.host().buffer_ranges().ranges.is_empty());
+        heap.host().buffer_ranges().work.scan();
+        crate::shadow::unregister(FILLER_RESOURCE, FILLER);
+        drop(filler);
+        assert_eq!(admission.used(), 0);
+        let second = host.new_list().unwrap();
+        state
+            .heap_buffers_budgeted(&second, 11, 11, &budget, buffer_test_limits())
+            .unwrap();
+        assert!(!heap.host().buffer_retry_pending(0));
+        assert_eq!(heap.host().buffer_ranges().ranges.len(), 1);
+        assert_eq!(admission.used(), 65536);
+        crate::shadow::unregister(RESOURCE, NEW);
+    }
+
+    #[test]
+    fn buffer_warm_permanent_invalid_view_never_becomes_ready_or_pinned() {
+        let heap = TestBindlessHeap::new(0x7edb_5400_0000, usize::MAX - 0x6efb);
+        let resource = [1u32, 0, 0, 0, 65536, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut view = [0u32; 16];
+        view[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        view[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view[6] = 64;
+        view[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+        view[10] = heap.address as u32;
+        view[11] = (heap.address >> 32) as u32;
+        crate::descriptor::create_placed_srv(
+            std::ptr::null(),
+            &resource,
+            &view,
+            crate::descriptor::heap(heap.object).handle(0).unwrap(),
+        );
+        let host = crate::host::host().unwrap();
+        let budget = std::sync::Mutex::new(BufferWarmBudget::default());
+        let mut state = State::default();
+        state.set_heaps(&[heap.object]);
+        let references = crate::host::references(&heap.shadow.buffer);
+        for frame in 1..=2 {
+            heap.host().buffer_ranges().work.scan();
+            let list = host.new_list().unwrap();
+            state
+                .heap_buffers_budgeted(&list, frame, frame, &budget, buffer_test_limits())
+                .unwrap();
+            assert!(heap.host().buffer_ranges().ranges.is_empty());
+            assert!(!heap.host().buffer_retry_pending(0));
+            assert!(!heap.host().buffer_slot_ready(0));
+            assert_eq!(crate::host::references(&heap.shadow.buffer), references);
+            assert_eq!(std::sync::Arc::strong_count(&heap.shadow), 2);
+        }
+    }
+
+    #[test]
+    fn buffer_warm_new_span_bypasses_unwatched_suppression_in_the_same_frame() {
+        let memory = crate::resource::Memory::zeroed(65536, 65536).unwrap();
+        unsafe { std::ptr::write_bytes(memory.address() as *mut u8, 0x11, 512) };
+        let heap = TestBindlessHeap::with_slots(memory.address(), usize::MAX - 0x6efc, 2);
+        heap.rewrite_buffer_slot(1, memory.address(), 64);
+        let host = crate::host::host().unwrap();
+        let budget = std::sync::Mutex::new(BufferWarmBudget::default());
+        let mut state = State::default();
+        state.set_heaps(&[heap.object]);
+        heap.shadow.update(memory.address() as usize, 256);
+        assert!(heap.shadow.unwatched());
+        let first = host.new_list().unwrap();
+        state
+            .heap_buffers_budgeted(
+                &first,
+                7,
+                7,
+                &budget,
+                BufferWarmLimits {
+                    bytes: 1,
+                    ..buffer_test_limits()
+                },
+            )
+            .unwrap();
+        assert_eq!(heap.host().buffer_ranges().ranges.len(), 1);
+        first.close();
+        host.execute(&[&first]);
+        assert!(heap.shadow.unwatched());
+        crate::watch::writing(memory.address() as usize + 256, 256);
+        unsafe { std::ptr::write_bytes((memory.address() + 256) as *mut u8, 0xa7, 256) };
+        crate::watch::wrote(memory.address() as usize + 256, 256);
+        let second = host.new_list().unwrap();
+        state
+            .heap_buffers_budgeted(
+                &second,
+                7,
+                7,
+                &budget,
+                BufferWarmLimits {
+                    bytes: 131072,
+                    ..buffer_test_limits()
+                },
+            )
+            .unwrap();
+        assert_eq!(heap.host().buffer_ranges().ranges.len(), 2);
+        second.close();
+        host.execute(&[&second]);
+        let mut mapped = std::ptr::null_mut();
+        unsafe {
+            heap.shadow.buffer.Map(0, None, Some(&mut mapped)).unwrap();
+            assert_eq!(*(mapped as *const u8), 0x11);
+            assert_eq!(*(mapped as *const u8).add(256), 0xa7);
+            heap.shadow.buffer.Unmap(0, None);
+        }
+    }
+
+    #[test]
+    fn bindless_buffer_heaps_switch_independently_in_one_recorded_list() {
+        const FRAME: u64 = 0x7edb_3000;
+        let first = TestBindlessHeap::new(0x7edb_3000_0000, usize::MAX - 0x6ef0);
+        let second = TestBindlessHeap::new(0x7edb_3001_0000, usize::MAX - 0x6ef1);
+        let host = crate::host::host().expect("D3D12 host");
+        let list = host.new_list().expect("recorded list");
+        let strides = |heap: &TestBindlessHeap| {
+            crate::host::references(heap.host().strides_buffer().unwrap())
+        };
+        let before = [strides(&first), strides(&second)];
+        let views = [
+            crate::host::references(&first.shadow.buffer),
+            crate::host::references(&second.shadow.buffer),
+        ];
+        let mut state = State::default();
+        let budget = std::sync::Mutex::new(BufferWarmBudget::default());
+        for heap in [&first, &second, &first] {
+            state.set_heaps(&[heap.object]);
+            assert_eq!(
+                state.heap_buffers_budgeted(&list, FRAME, FRAME, &budget, buffer_test_limits()),
+                heap.host().strides_gpu()
+            );
+        }
+        for (n, heap) in [&first, &second].into_iter().enumerate() {
+            let cache = heap.host().buffer_ranges();
+            assert_eq!(cache.passes, 1);
+            assert_eq!(cache.last_frame, Some(FRAME));
+            assert!(cache.ranges.contains_key(&0));
+            assert_eq!(strides(heap), before[n] + 1);
+            assert_eq!(crate::host::references(&heap.shadow.buffer), views[n] + 1);
+            assert_eq!(std::sync::Arc::strong_count(&heap.shadow), 4);
+        }
+        list.close();
+        list.reset();
+        for (n, heap) in [&first, &second].into_iter().enumerate() {
+            assert_eq!(strides(heap), before[n]);
+            state.set_heaps(&[heap.object]);
+            state
+                .heap_buffers_budgeted(&list, FRAME, FRAME, &budget, buffer_test_limits())
+                .unwrap();
+            assert_eq!(strides(heap), before[n] + 1);
+            assert_eq!(heap.host().buffer_ranges().passes, 1);
+        }
+    }
+
+    #[test]
+    fn bindless_buffer_heaps_prepare_independently_in_one_frame_across_lists() {
+        const FRAME: u64 = 0x7edb_4000;
+        let first = TestBindlessHeap::new(0x7edb_4000_0000, usize::MAX - 0x6ef2);
+        let second = TestBindlessHeap::new(0x7edb_4001_0000, usize::MAX - 0x6ef3);
+        let host = crate::host::host().expect("D3D12 host");
+        let a = host.new_list().expect("first recorded list");
+        let b = host.new_list().expect("second recorded list");
+        let budget = std::sync::Mutex::new(BufferWarmBudget::default());
+        for (heap, list) in [(&first, &a), (&second, &b)] {
+            let stride_before = crate::host::references(heap.host().strides_buffer().unwrap());
+            let view_before = crate::host::references(&heap.shadow.buffer);
+            let mut state = State::default();
+            state.set_heaps(&[heap.object]);
+            assert_eq!(
+                state.heap_buffers_budgeted(list, FRAME, FRAME, &budget, buffer_test_limits()),
+                heap.host().strides_gpu()
+            );
+            let cache = heap.host().buffer_ranges();
+            assert_eq!(cache.passes, 1);
+            assert_eq!(cache.last_frame, Some(FRAME));
+            assert!(cache.ranges.contains_key(&0));
+            assert_eq!(
+                crate::host::references(heap.host().strides_buffer().unwrap()),
+                stride_before + 1
+            );
+            assert_eq!(
+                crate::host::references(&heap.shadow.buffer),
+                view_before + 1
+            );
+            assert_eq!(std::sync::Arc::strong_count(&heap.shadow), 4);
+        }
+    }
     #[test]
     fn completed_dynamic_tables_require_a_new_recording_before_resubmission() {
         let mut state = State::default();

@@ -2372,6 +2372,10 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
+    if let ("s_bfm_b32", 0, [Operand::Const(w), Operand::Const(at)]) = (inst.name(), k, &src[..]) {
+        let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
+        return Some(Moved::Const(((1u32 << w) - 1) << at));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
@@ -2384,6 +2388,9 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         // that has no inline form; fold more if descriptors need it.
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
+        ("s_mov_b64", Operand::Literal(x)) if x >> 31 == 0 => {
+            Some(Moved::Const(if k == 0 { x } else { 0 }))
+        }
         // 64-bit inline integers are sign-extended.
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;
@@ -2805,6 +2812,110 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(r.scalar, [((0, 2), at(0, 0)), ((0, 3), at(0, 0x10))]);
+    }
+
+    #[test]
+    fn sampler_words_from_bit_masks_and_wide_literals_are_constants() {
+        let code: Vec<u8> = [0xB010_3092, 0x9211_8C8C, 0xBE92_04FF, 0x1850_0000, S_ENDPGM]
+            .iter()
+            .flat_map(|w: &u32| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [param(Table, 4, 1)];
+        let t = Tracer::new(&p, &layout, HwStage::Cs, None).unwrap();
+        let block = &p.blocks[0];
+        let value = |n: usize, k: usize| t.origin(block.insts[n].writes[k].1);
+        assert_eq!(value(0, 0), Term::Const(0x3092));
+        assert_eq!(value(1, 0), Term::Const(0x00FF_F000));
+        assert_eq!(value(2, 0), Term::Const(0x1850_0000));
+        assert_eq!(value(2, 1), Term::Const(0));
+    }
+
+    #[test]
+    fn sampler_constants_reach_an_image_access_with_a_loaded_resource() {
+        let r = track_words(
+            &[
+                0xBE8C_0304,
+                0xBE8D_0380,
+                0xF40C_0806,
+                0xFA00_0000,
+                0xB010_3092,
+                0x9211_8C8C,
+                0xBE92_04FF,
+                0x1850_0000,
+                0xF09C_0708,
+                0x0088_1A0C,
+                S_ENDPGM,
+            ],
+            &[param(Table, 4, 1)],
+            HwStage::Cs,
+        );
+        assert_eq!(r.descriptors.len(), 2);
+        assert_eq!(r.descriptors[0].role, Role::Resource);
+        assert!(matches!(r.descriptors[0].source, Source::Loaded { .. }));
+        assert_eq!(r.descriptors[1].role, Role::Sampler);
+        assert_eq!(
+            r.descriptors[1].source,
+            Source::Constant(vec![0x3092, 0x00FF_F000, 0x1850_0000, 0])
+        );
+    }
+
+    #[test]
+    fn sampler_constant_folding_masks_bfm_width_and_offset() {
+        for width in [0u32, 12, 31, 32, 63, 64] {
+            for offset in [0u32, 12, 31, 32, 63, 64] {
+                let word = 0x9211_0000 | ((128 + offset) << 8) | (128 + width);
+                let code: Vec<u8> = [word, S_ENDPGM]
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect();
+                let p = crate::ir::build(&code, false, 256).unwrap();
+                let t = Tracer::new(&p, &[], HwStage::Cs, None).unwrap();
+                let expected = (0..32).fold(0u32, |bits, bit| {
+                    if bit >= offset % 32 && bit - offset % 32 < width % 32 {
+                        bits | (1 << bit)
+                    } else {
+                        bits
+                    }
+                });
+                assert_eq!(
+                    t.origin(p.blocks[0].insts[0].writes[0].1),
+                    Term::Const(expected),
+                    "width {width}, offset {offset}"
+                );
+            }
+        }
+        let code: Vec<u8> = [0x9211_8C00u32, S_ENDPGM]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let t = Tracer::new(&p, &[], HwStage::Cs, None).unwrap();
+        assert!(matches!(
+            t.origin(p.blocks[0].insts[0].writes[0].1),
+            Term::Value(_)
+        ));
+    }
+
+    #[test]
+    fn sampler_wide_literals_with_the_sign_bit_are_not_folded() {
+        for literal in [0u32, 0x1850_0000, 0x7FFF_FFFF, 0x8000_0000, u32::MAX] {
+            let code: Vec<u8> = [0xBE92_04FF, literal, S_ENDPGM]
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            let t = Tracer::new(&p, &[], HwStage::Cs, None).unwrap();
+            let inst = &p.blocks[0].insts[0];
+            let value = |k: usize| t.origin(inst.writes[k].1);
+            if literal < 0x8000_0000 {
+                assert_eq!(value(0), Term::Const(literal));
+                assert_eq!(value(1), Term::Const(0));
+            } else {
+                assert!(matches!(value(0), Term::Value(_)));
+                assert!(matches!(value(1), Term::Value(_)));
+            }
+        }
     }
 
     #[test]

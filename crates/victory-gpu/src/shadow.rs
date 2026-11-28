@@ -77,6 +77,8 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    #[cfg(test)]
+    test_budget: Option<Arc<TestCopyBudgetState>>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -641,6 +643,44 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if now.len().min(held.len()).min(title.len()) >= 32
+        && std::arch::is_x86_feature_detected!("avx2")
+    {
+        return unsafe { merge_piece_avx2(now, held, title) };
+    }
+    merge_piece_scalar(now, held, title)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_piece_avx2(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    use std::arch::x86_64::*;
+    let n = now.len().min(held.len()).min(title.len());
+    let mut differs = _mm256_setzero_si256();
+    let mut at = 0;
+    while n - at >= 32 {
+        let (gpu, old, cpu) = unsafe {
+            (
+                _mm256_loadu_si256(now.as_ptr().add(at).cast()),
+                _mm256_loadu_si256(held.as_ptr().add(at).cast()),
+                _mm256_loadu_si256(title.as_ptr().add(at).cast()),
+            )
+        };
+        let same = _mm256_cmpeq_epi8(gpu, old);
+        let merged = _mm256_blendv_epi8(gpu, cpu, same);
+        differs = _mm256_or_si256(differs, _mm256_xor_si256(merged, cpu));
+        unsafe {
+            _mm256_storeu_si256(title.as_mut_ptr().add(at).cast(), merged);
+            _mm256_storeu_si256(held.as_mut_ptr().add(at).cast(), gpu);
+        }
+        at += 32;
+    }
+    let tail = merge_piece_scalar(&now[at..], &mut held[at..], &mut title[at..]);
+    _mm256_testz_si256(differs, differs) == 0 || tail
+}
+
+fn merge_piece_scalar(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     let mut differs = 0u8;
     for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
         let wrote = if *n != *h { 0xffu8 } else { 0 };
@@ -678,6 +718,87 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
 #[cfg(test)]
 mod relay_tests {
     use super::{Flights, changed_runs, merge_piece, outside};
+
+    #[test]
+    fn vector_merge_matches_byte_oracle_without_touching_gpu_or_surroundings() {
+        let mut seed = 0x17e6_39a5u32;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for round in 0..2048 {
+            let n = if round < 131 {
+                round
+            } else {
+                random() as usize % 2049
+            };
+            let now_at = round % 32;
+            let held_at = (round / 32) % 32;
+            let title_at = random() as usize % 32;
+            let now_n = n + random() as usize % 4;
+            let held_n = n + random() as usize % 4;
+            let title_n = n + random() as usize % 4;
+            let now: Vec<u8> = (0..now_at + now_n + 32).map(|_| random() as u8).collect();
+            let mut held: Vec<u8> = (0..held_at + held_n + 32).map(|_| random() as u8).collect();
+            let mut title: Vec<u8> = (0..title_at + title_n + 32)
+                .map(|_| random() as u8)
+                .collect();
+            let common = now_n.min(held_n).min(title_n);
+            for i in 0..common {
+                match round % 5 {
+                    0 => held[held_at + i] = now[now_at + i],
+                    1 => title[title_at + i] = now[now_at + i],
+                    2 => held[held_at + i] = now[now_at + i] ^ 0xff,
+                    3 => held[held_at + i] = now[now_at + i] ^ (i % 2) as u8,
+                    _ => {}
+                }
+            }
+            let gpu = now.clone();
+            let mut expected_held = held.clone();
+            let mut expected_title = title.clone();
+            let mut expected_changed = false;
+            for i in 0..common {
+                if now[now_at + i] != held[held_at + i] {
+                    expected_changed |= now[now_at + i] != title[title_at + i];
+                    expected_held[held_at + i] = now[now_at + i];
+                    expected_title[title_at + i] = now[now_at + i];
+                }
+            }
+            if round % 5 <= 1 {
+                assert!(!expected_changed, "idempotent round {round}");
+            }
+            for mode in 0..3 {
+                let mut actual_held = held.clone();
+                let mut actual_title = title.clone();
+                let args = (
+                    &now[now_at..now_at + now_n],
+                    &mut actual_held[held_at..held_at + held_n],
+                    &mut actual_title[title_at..title_at + title_n],
+                );
+                let changed = match mode {
+                    0 => super::merge_piece_scalar(args.0, args.1, args.2),
+                    1 => merge_piece(args.0, args.1, args.2),
+                    #[cfg(target_arch = "x86_64")]
+                    2 if std::arch::is_x86_feature_detected!("avx2") => unsafe {
+                        super::merge_piece_avx2(args.0, args.1, args.2)
+                    },
+                    _ => continue,
+                };
+                assert_eq!(
+                    changed, expected_changed,
+                    "changed round {round} mode {mode}"
+                );
+                assert_eq!(actual_held, expected_held, "held round {round} mode {mode}");
+                assert_eq!(
+                    actual_title, expected_title,
+                    "title round {round} mode {mode}"
+                );
+                assert_eq!(now, gpu, "GPU source round {round} mode {mode}");
+            }
+        }
+    }
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
@@ -960,9 +1081,42 @@ fn give_back(v: Vec<u8>) {
 
 const NOT_WATCHED: u8 = 2;
 
-/// Where `a` and `b` (of one length) first differ, compared eight bytes at
-/// a time.
+/// Where `a` and `b` (of one length) first differ.
 fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    if a.len().min(b.len()) >= 32 && std::arch::is_x86_feature_detected!("avx2") {
+        return unsafe { first_difference_avx2(a, b) };
+    }
+    first_difference_scalar(a, b)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn first_difference_avx2(a: &[u8], b: &[u8]) -> Option<usize> {
+    use std::arch::x86_64::*;
+    let n = a.len().min(b.len());
+    let mut at = 0;
+    while n - at >= 32 {
+        let same = unsafe {
+            _mm256_cmpeq_epi8(
+                _mm256_loadu_si256(a.as_ptr().add(at).cast()),
+                _mm256_loadu_si256(b.as_ptr().add(at).cast()),
+            )
+        };
+        let differ = !(_mm256_movemask_epi8(same) as u32);
+        if differ != 0 {
+            return Some(at + differ.trailing_zeros() as usize);
+        }
+        at += 32;
+    }
+    a[at..n]
+        .iter()
+        .zip(&b[at..n])
+        .position(|(a, b)| a != b)
+        .map(|i| at + i)
+}
+
+fn first_difference_scalar(a: &[u8], b: &[u8]) -> Option<usize> {
     let whole = a.len().min(b.len()) / 8 * 8;
     let from = a[..whole]
         .as_chunks::<8>()
@@ -980,6 +1134,35 @@ fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
 
 /// Where `a` and `b` (of one length) last differ.
 fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    if a.len().min(b.len()) >= 32 && std::arch::is_x86_feature_detected!("avx2") {
+        return unsafe { last_difference_avx2(a, b) };
+    }
+    last_difference_scalar(a, b)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn last_difference_avx2(a: &[u8], b: &[u8]) -> Option<usize> {
+    use std::arch::x86_64::*;
+    let mut at = a.len().min(b.len());
+    while at >= 32 {
+        at -= 32;
+        let same = unsafe {
+            _mm256_cmpeq_epi8(
+                _mm256_loadu_si256(a.as_ptr().add(at).cast()),
+                _mm256_loadu_si256(b.as_ptr().add(at).cast()),
+            )
+        };
+        let differ = !(_mm256_movemask_epi8(same) as u32);
+        if differ != 0 {
+            return Some(at + 31 - differ.leading_zeros() as usize);
+        }
+    }
+    a[..at].iter().zip(&b[..at]).rposition(|(a, b)| a != b)
+}
+
+fn last_difference_scalar(a: &[u8], b: &[u8]) -> Option<usize> {
     let whole = a.len().min(b.len()) / 8 * 8;
     if let Some(i) = a[whole..]
         .iter()
@@ -1005,6 +1188,75 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod difference_tests {
     use super::{first_difference, last_difference};
+
+    #[test]
+    fn vector_difference_searches_match_byte_oracle_for_unaligned_tails() {
+        let mut seed = 0x35d0_891cu32;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for round in 0..2048 {
+            let n = if round < 131 {
+                round
+            } else {
+                random() as usize % 4097
+            };
+            let a_at = round % 32;
+            let b_at = (round / 32) % 32;
+            let a_n = n;
+            let b_n = n + random() as usize % 5;
+            let a: Vec<u8> = (0..a_at + a_n + 32).map(|_| random() as u8).collect();
+            let mut b: Vec<u8> = (0..b_at + b_n + 32).map(|_| random() as u8).collect();
+            b[b_at..b_at + n].copy_from_slice(&a[a_at..a_at + n]);
+            if n > 0 {
+                match round % 4 {
+                    0 => {}
+                    1 => b[b_at + random() as usize % n] ^= 1,
+                    2 => {
+                        let first = random() as usize % n;
+                        let last = random() as usize % n;
+                        b[b_at + first] ^= 0x80;
+                        b[b_at + last] ^= 0x41;
+                    }
+                    _ => b[b_at..b_at + n].iter_mut().for_each(|byte| *byte ^= 0x11),
+                }
+            }
+            let (a, b) = (&a[a_at..a_at + a_n], &b[b_at..b_at + b_n]);
+            let first = a.iter().zip(b).position(|(a, b)| a != b);
+            let last = a.iter().zip(b).rposition(|(a, b)| a != b);
+            assert_eq!(
+                super::first_difference_scalar(a, b),
+                first,
+                "scalar first {round}"
+            );
+            assert_eq!(
+                super::last_difference_scalar(a, b),
+                last,
+                "scalar last {round}"
+            );
+            assert_eq!(first_difference(a, b), first, "runtime first {round}");
+            assert_eq!(last_difference(a, b), last, "runtime last {round}");
+            #[cfg(target_arch = "x86_64")]
+            if std::arch::is_x86_feature_detected!("avx2") {
+                assert_eq!(
+                    unsafe { super::first_difference_avx2(a, b) },
+                    first,
+                    "AVX2 first {round}"
+                );
+                assert_eq!(
+                    unsafe { super::last_difference_avx2(a, b) },
+                    last,
+                    "AVX2 last {round}"
+                );
+            }
+            let (a, b) = (b, a);
+            assert_eq!(first_difference(a, b), first, "reverse first {round}");
+            assert_eq!(last_difference(a, b), last, "reverse last {round}");
+        }
+    }
 
     /// The word-wise searches agree with the byte-wise ones they replace.
     #[test]
@@ -1508,6 +1760,54 @@ pub(crate) fn merged_stats() -> [u64; 3] {
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    #[cfg(target_arch = "x86_64")]
+    if now.len().min(was.len()) >= 32 && std::arch::is_x86_feature_detected!("avx2") {
+        return unsafe { changed_runs_avx2(now, was) };
+    }
+    changed_runs_scalar(now, was)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_runs_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use std::arch::x86_64::*;
+    let n = now.len().min(was.len());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut push = |from: usize, len: usize| match runs.last_mut() {
+        Some((at, size)) if *at + *size == from => *size += len,
+        _ => runs.push((from, len)),
+    };
+    let mut at = 0;
+    while n - at >= 32 {
+        let same = unsafe {
+            _mm256_cmpeq_epi8(
+                _mm256_loadu_si256(now.as_ptr().add(at).cast()),
+                _mm256_loadu_si256(was.as_ptr().add(at).cast()),
+            )
+        };
+        let mut differ = !(_mm256_movemask_epi8(same) as u32);
+        while differ != 0 {
+            let first = differ.trailing_zeros();
+            let count = (differ >> first).trailing_ones();
+            push(at + first as usize, count as usize);
+            let end = first + count;
+            if end == 32 {
+                break;
+            }
+            differ &= u32::MAX << end;
+        }
+        at += 32;
+    }
+    while at < n {
+        if now[at] != was[at] {
+            push(at, 1);
+        }
+        at += 1;
+    }
+    runs
+}
+
+fn changed_runs_scalar(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -1533,7 +1833,104 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod merge_tests {
-    use super::changed_runs;
+    use super::{changed_runs, changed_runs_scalar};
+
+    fn byte_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+        let mut runs = Vec::new();
+        let mut from = None;
+        for (at, (now, was)) in now.iter().zip(was).enumerate() {
+            match (now != was, from) {
+                (true, None) => from = Some(at),
+                (false, Some(first)) => {
+                    runs.push((first, at - first));
+                    from = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(first) = from {
+            runs.push((first, now.len().min(was.len()) - first));
+        }
+        runs
+    }
+
+    #[test]
+    fn changed_runs_match_byte_oracle_for_unaligned_random_inputs() {
+        let mut seed = 0x39a1_875cu32;
+        let mut random = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed
+        };
+        for round in 0..2048 {
+            let n = random() as usize % 1025;
+            let now_at = random() as usize % 32;
+            let was_at = random() as usize % 32;
+            let now_n = n + random() as usize % 4;
+            let was_n = n + random() as usize % 4;
+            let mut now: Vec<u8> = (0..now_at + now_n).map(|_| random() as u8).collect();
+            let mut was: Vec<u8> = (0..was_at + was_n).map(|_| random() as u8).collect();
+            let common = now_n.min(was_n);
+            was[was_at..was_at + common].copy_from_slice(&now[now_at..now_at + common]);
+            match round % 5 {
+                0 => {}
+                1 => now[now_at..].iter_mut().for_each(|b| *b ^= 0x80),
+                2 => {
+                    for (at, b) in now[now_at..].iter_mut().enumerate() {
+                        if at % 2 == 0 {
+                            *b ^= 0x41;
+                        }
+                    }
+                }
+                _ => {
+                    for _ in 0..random() % 80 {
+                        if now_n == 0 {
+                            break;
+                        }
+                        let first = random() as usize % now_n;
+                        let len = (random() as usize % 65).min(now_n - first);
+                        for b in &mut now[now_at + first..now_at + first + len] {
+                            *b ^= (random() as u8) | 1;
+                        }
+                    }
+                }
+            }
+            let (now, was) = (&now[now_at..], &was[was_at..]);
+            let expected = byte_runs(now, was);
+            assert_eq!(
+                changed_runs_scalar(now, was),
+                expected,
+                "scalar round {round}"
+            );
+            assert_eq!(changed_runs(now, was), expected, "runtime round {round}");
+            #[cfg(target_arch = "x86_64")]
+            if std::arch::is_x86_feature_detected!("avx2") {
+                assert_eq!(
+                    unsafe { super::changed_runs_avx2(now, was) },
+                    expected,
+                    "AVX2 round {round}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn changed_runs_keep_equal_bytes_at_vector_and_dword_boundaries() {
+        for n in [31, 32, 33, 63, 64, 65, 95, 96, 97, 255, 256, 257] {
+            let was = vec![0x42; n];
+            for at in 0..n {
+                let mut now = was.clone();
+                now[at] ^= 1;
+                assert_eq!(changed_runs(&now, &was), [(at, 1)], "{n} {at}");
+            }
+            let mut now = was.clone();
+            now[1..n - 1].fill(0x41);
+            assert_eq!(changed_runs(&now, &was), [(1, n - 2)]);
+            if n > 32 {
+                now[31] = was[31];
+            }
+            assert_eq!(changed_runs(&now, &was), byte_runs(&now, &was));
+        }
+    }
 
     /// The runs hold exactly the bytes that differ: putting them into the
     /// old bytes gives the new ones, and no run holds an equal byte.
@@ -1579,17 +1976,88 @@ mod merge_tests {
 static LIVE: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+pub(crate) fn live_copy_bytes() -> u64 {
+    LIVE[1].load(Ordering::Relaxed)
+}
+
 /// Serializes host-copy creation against the profile's budget.
 static COPY_BUDGET: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+struct TestCopyBudgetState {
+    limit: AtomicU64,
+    used: AtomicU64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_COPY_BUDGET: std::cell::RefCell<Option<Arc<TestCopyBudgetState>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestCopyBudget {
+    state: Arc<TestCopyBudgetState>,
+    previous: Option<Arc<TestCopyBudgetState>>,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl TestCopyBudget {
+    pub(crate) fn new(limit: u64) -> Self {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let state = Arc::new(TestCopyBudgetState {
+            limit: AtomicU64::new(limit),
+            used: AtomicU64::new(0),
+        });
+        let previous = TEST_COPY_BUDGET.with(|slot| slot.replace(Some(state.clone())));
+        Self {
+            state,
+            previous,
+            _serial: serial,
+        }
+    }
+
+    pub(crate) fn set_limit(&self, limit: u64) {
+        self.state.limit.store(limit, Ordering::Relaxed);
+    }
+
+    pub(crate) fn used(&self) -> u64 {
+        self.state.used.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestCopyBudget {
+    fn drop(&mut self) {
+        if let Ok(mut windows) = LOOSE.lock() {
+            release_unused_windows(&mut windows, u64::MAX);
+        }
+        TEST_COPY_BUDGET.with(|slot| slot.replace(self.previous.take()));
+    }
+}
+
+fn copy_budget() -> (crate::console::Limits, u64) {
+    let limits = *crate::console::limits();
+    #[cfg(test)]
+    if let Some(state) = TEST_COPY_BUDGET.with(|slot| slot.borrow().clone()) {
+        let mut limits = limits;
+        limits.host_copy_bytes = state.limit.load(Ordering::Relaxed);
+        return (limits, state.used.load(Ordering::Relaxed));
+    }
+    (limits, LIVE[1].load(Ordering::Relaxed))
+}
 
 /// Whether a host copy of `size` bytes fits the profile. The cap counts every
 /// copy (buffers and windows outside buffers) and is the PC's memory; a copy
 /// past it is refused instead of ending the run in the paging file.
-fn admit_host_copy(size: u64, windows: Option<&mut BTreeMap<(u64, u64), Arc<Shadow>>>) -> bool {
-    let limits = crate::console::limits();
-    let mut used = LIVE[1].load(Ordering::Relaxed);
+fn admit_host_copy(
+    size: u64,
+    windows: Option<&mut BTreeMap<(u64, u64), Arc<Shadow>>>,
+) -> Result<(), FindError> {
+    let (limits, mut used) = copy_budget();
     if limits.admits_host_copy(used, size) {
-        return true;
+        return Ok(());
     }
     let needed = used
         .saturating_add(size)
@@ -1610,14 +2078,14 @@ fn admit_host_copy(size: u64, windows: Option<&mut BTreeMap<(u64, u64), Arc<Shad
         });
     }
     if released != 0 {
-        used = LIVE[1].load(Ordering::Relaxed);
+        used = copy_budget().1;
         tracing::info!(
             released_mb = released >> 20,
             used_mb = used >> 20,
             "unused host copies released under copy-memory pressure"
         );
         if limits.admits_host_copy(used, size) {
-            return true;
+            return Ok(());
         }
     }
     static REFUSED: AtomicU64 = AtomicU64::new(0);
@@ -1631,10 +2099,23 @@ fn admit_host_copy(size: u64, windows: Option<&mut BTreeMap<(u64, u64), Arc<Shad
             "host copy over the memory profile's host-copy budget: not made (the draw reads no copy)"
         );
     }
-    false
+    Err(if size > limits.host_copy_bytes {
+        FindError::Unavailable
+    } else {
+        FindError::Budget
+    })
 }
 
 fn unused_copy(shadow: &Arc<Shadow>) -> bool {
+    #[cfg(test)]
+    if let Some(budget) = TEST_COPY_BUDGET.with(|slot| slot.borrow().clone())
+        && !shadow
+            .test_budget
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, &budget))
+    {
+        return false;
+    }
     shadow.place.is_none()
         && Arc::strong_count(shadow) == 1
         && crate::host::references(&shadow.buffer) == 1
@@ -1715,6 +2196,10 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(budget) = &self.test_budget {
+            budget.used.fetch_sub(self.len, Ordering::Relaxed);
+        }
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -2049,6 +2534,10 @@ impl Shadow {
         // title wrote there.
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(budget) = shadow.test_budget.take() {
+            budget.used.fetch_sub(len, Ordering::Relaxed);
+        }
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
@@ -2088,6 +2577,14 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            #[cfg(test)]
+            test_budget: TEST_COPY_BUDGET.with(|slot| {
+                let budget = slot.borrow().clone();
+                if let Some(budget) = &budget {
+                    budget.used.fetch_add(len, Ordering::Relaxed);
+                }
+                budget
+            }),
         }
     }
 
@@ -3186,6 +3683,16 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_for_view(address, len).ok()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FindError {
+    Budget,
+    Unavailable,
+}
+
+pub(crate) fn find_for_view(address: u64, len: u64) -> Result<Arc<Shadow>, FindError> {
     lookup(address, len, false)
 }
 
@@ -3211,11 +3718,13 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if !fine() {
         return find(address, len);
     }
-    lookup(address, len, true)
+    lookup(address, len, true).ok()
 }
 
-fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
-    let end = address.checked_add(len.max(1))?;
+fn lookup(address: u64, len: u64, any: bool) -> Result<Arc<Shadow>, FindError> {
+    let end = address
+        .checked_add(len.max(1))
+        .ok_or(FindError::Unavailable)?;
     let mut map = buffers();
     let key = map
         .range(..=(address, usize::MAX))
@@ -3227,11 +3736,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         drop(map);
         return loose(address, end, len <= 1, any);
     };
-    let entry = map.get(&key)?;
+    let entry = map.get(&key).ok_or(FindError::Unavailable)?;
     if entry.shadow.is_none() {
         let size = (entry.end - key.0).next_multiple_of(1 << 16);
-        let limits = crate::console::limits();
-        let used = LIVE[1].load(Ordering::Relaxed);
+        let (limits, used) = copy_budget();
         if !limits.admits_host_copy(used, size) && size <= limits.host_copy_bytes {
             let needed = used
                 .saturating_add(size)
@@ -3239,7 +3747,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             release_unused_buffers(&mut map, needed, 0, 0);
         }
     }
-    let entry = map.get_mut(&key)?;
+    let entry = map.get_mut(&key).ok_or(FindError::Unavailable)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -3247,7 +3755,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let size = len.next_multiple_of(1 << 16);
         if let Some(placed) = crate::port::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
+            return entry.shadow.clone().ok_or(FindError::Unavailable);
         }
         // The profile's cap on host copies, checked under one lock with the
         // allocation so two copies cannot both pass it.
@@ -3258,13 +3766,13 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let big = cards() && size >= card_limits().0;
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
+            return entry.shadow.clone().ok_or(FindError::Unavailable);
         }
         let _budget = COPY_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
-        if !admit_host_copy(size, None) {
-            return None;
-        }
-        let (buffer, data) = host()?.shared_buffer(size)?;
+        admit_host_copy(size, None)?;
+        let (buffer, data) = host()
+            .and_then(|host| host.shared_buffer(size))
+            .ok_or(FindError::Unavailable)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
@@ -3315,9 +3823,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         entry.shadow = Some(shadow);
     }
-    let shadow = entry.shadow.as_ref()?;
+    let shadow = entry.shadow.as_ref().ok_or(FindError::Unavailable)?;
     shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-    Some(shadow.clone())
+    Ok(shadow.clone())
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
@@ -3471,7 +3979,7 @@ fn longest_tail(
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
-fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Result<Arc<Shadow>, FindError> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
@@ -3502,7 +4010,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     };
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
-        return Some(shadow.clone());
+        return Ok(shadow.clone());
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
@@ -3512,14 +4020,14 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
-        return Some(shadow);
+        return Ok(shadow);
     }
     // The profile's cap on host copies, as for title buffers.
     let _budget = COPY_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
-    if !admit_host_copy(len, Some(&mut map)) {
-        return None;
-    }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    admit_host_copy(len, Some(&mut map))?;
+    let (buffer, data) = host()
+        .and_then(|host| host.shared_buffer(len))
+        .ok_or(FindError::Unavailable)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
     // buffer there, and the one just made is the CPU's side.
@@ -3558,12 +4066,42 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
-    Some(shadow)
+    Ok(shadow)
 }
 
 #[cfg(test)]
 mod window_tests {
     use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
+
+    #[test]
+    fn buffer_budget_retry_propagates_loose_window_pressure() {
+        let budget = super::TestCopyBudget::new(WINDOW);
+        const FILLER: u64 = 0x7edc_5000_0000;
+        const TARGET: u64 = 0x7edc_5100_0000;
+        super::register(FILLER as usize, FILLER, 65536);
+        let filler = super::find_for_view(FILLER, 65536).expect("real shared buffer filler");
+        assert!(matches!(
+            super::find_for_view(TARGET, 1),
+            Err(super::FindError::Budget)
+        ));
+        super::unregister(FILLER as usize, FILLER);
+        drop(filler);
+        assert_eq!(budget.used(), 0);
+        let window =
+            super::find_for_view(TARGET, 1).expect("window fits after releasing the filler");
+        assert_eq!(window.span(), (TARGET, WINDOW));
+        assert_eq!(budget.used(), WINDOW);
+    }
+
+    #[test]
+    fn buffer_budget_retry_does_not_retry_an_oversized_window() {
+        let budget = super::TestCopyBudget::new(65536);
+        assert!(matches!(
+            super::find_for_view(0x7edc_5200_0000, 1),
+            Err(super::FindError::Unavailable)
+        ));
+        assert_eq!(budget.used(), 0);
+    }
 
     /// An ask that may take any window takes the longest that holds all of
     /// it, and none that holds only a part.
