@@ -166,6 +166,88 @@ pub(crate) fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"))
 }
 
+#[derive(Clone, Copy)]
+struct Region {
+    base: usize,
+    first: usize,
+    last: usize,
+    mapped: bool,
+    whole: bool,
+}
+
+static REGIONS: Mutex<BTreeMap<usize, Region>> = Mutex::new(BTreeMap::new());
+
+/// Caches the title allocation containing `at` so Wine/Proton avoids taking its
+/// VM lock on repeated `VirtualQuery` and failed `GetWriteWatch` calls.
+fn allocation(at: usize) -> Option<Region> {
+    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let page = at / PAGE;
+    if let Some((_, &r)) = REGIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..=page)
+        .next_back()
+        && page < r.last
+    {
+        return Some(r);
+    }
+    let query = |p: usize| {
+        // SAFETY: plain out buffer filled in by `VirtualQuery`.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid output pointer and byte size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        (n != 0).then_some(info)
+    };
+    let info = query(at)?;
+    let base = info.AllocationBase as usize;
+    if base == 0 {
+        return None;
+    }
+    let mut end = base;
+    let mut done = false;
+    for _ in 0..256 {
+        let Some(i) = query(end) else {
+            done = true;
+            break;
+        };
+        if i.AllocationBase as usize != base {
+            done = true;
+            break;
+        }
+        let next = (i.BaseAddress as usize).saturating_add(i.RegionSize);
+        if next <= end {
+            break;
+        }
+        end = next;
+    }
+    if !done {
+        end = end
+            .max((at / PAGE + 1) * PAGE)
+            .max(at.saturating_add(256 << 20));
+    }
+    let r = Region {
+        base,
+        first: base.div_ceil(PAGE),
+        last: end / PAGE,
+        mapped: info.Type == MEM_MAPPED,
+        whole: done && end - base <= 4 << 30,
+    };
+    if r.first * PAGE > at || r.last <= r.first {
+        return None;
+    }
+    let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    regions.retain(|_, o| o.last <= r.first || o.first >= r.last);
+    regions.insert(r.first, r);
+    Some(r)
+}
+
+fn forget_region(base: usize) {
+    REGIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, r| r.base != base);
+}
+
 /// With [`once`]: asks about `ranges` (everything a submission's lists
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
 /// [`ask_once_end`].
@@ -173,8 +255,17 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
+    let wine = crate::host::on_wine();
     ask_once_end();
     ask_ahead(ranges);
+    let wine_regions: Vec<Option<Region>> = if wine {
+        ranges
+            .iter()
+            .map(|&(start, end)| (start < end).then(|| allocation(start)).flatten())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     if j.ahead.is_empty() {
@@ -187,13 +278,21 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
-    for &(start, end) in ranges {
+    for (idx, &(start, end)) in ranges.iter().enumerate() {
         if start >= end {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
-            j.ahead.push((first, last));
+        let region = wine_regions.get(idx).copied().flatten();
+        if region.is_some_and(|r| r.mapped && end <= r.last * PAGE) {
+            continue;
+        }
+        let (kfirst, klast) = match region {
+            Some(r) if r.whole && r.first <= first && last <= r.last => (r.first, r.last),
+            _ => (first, last),
+        };
+        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, kfirst, klast) {
+            j.ahead.push((kfirst, klast));
         }
     }
     j.kept = !j.ahead.is_empty();
@@ -313,71 +412,118 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
-    // Asked ahead with the submission's other ranges: the journal has it.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
-            j.ahead_asked,
+    let wine = crate::host::on_wine();
+    let region = if wine { allocation(start) } else { None };
+    let mapped = region.is_some_and(|r| r.mapped && end <= r.last * PAGE);
+    let (kfirst, klast) = match region {
+        Some(r) if !r.mapped && r.whole && r.first <= first && last <= r.last => (r.first, r.last),
+        _ => (first, last),
+    };
+    let mut drop_region = false;
+    let out = {
+        let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let j = &mut *journal;
+        // Asked ahead with the submission's other ranges: the journal has it.
+        if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            return Some((
+                j.ahead_asked,
+                j.written
+                    .range(first..last)
+                    .map(|(&p, &w)| (p, w))
+                    .collect(),
+            ));
+        }
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let ask = |afirst: usize, alast: usize, found: &mut Vec<usize>| -> Option<usize> {
+            let mut count = (alast - afirst) * PAGE / KERNEL_PAGE;
+            if found.len() < count {
+                found.resize(count, 0);
+            }
+            let mut granularity = 0;
+            // SAFETY: the answer buffer holds `count` entries.
+            let ok = unsafe {
+                GetWriteWatch(
+                    WRITE_WATCH_FLAG_RESET,
+                    (afirst * PAGE) as *const _,
+                    (alast - afirst) * PAGE,
+                    found.as_mut_ptr().cast(),
+                    &mut count,
+                    &mut granularity,
+                )
+            } == 0;
+            ok.then_some(count)
+        };
+        let mut asked_range = (kfirst, klast);
+        let mut answer = if mapped {
+            None
+        } else {
+            ask(kfirst, klast, &mut j.found)
+        };
+        if answer.is_none() && !mapped && (kfirst, klast) != (first, last) {
+            drop_region = true;
+            asked_range = (first, last);
+            answer = ask(first, last, &mut j.found);
+        }
+        let failed = answer.is_none();
+        let mut count = answer.unwrap_or(0);
+        let guarded = if failed {
+            count = 0;
+            if !guarded {
+                None
+            } else {
+                #[cfg(feature = "diagnostics")]
+                let guarding = std::time::Instant::now();
+                let written = guard_checked(first * PAGE, last * PAGE, mapped);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(
+                    crate::copystat::C::GuardUs,
+                    guarding.elapsed().as_micros() as u64,
+                );
+                if written.is_none() && mapped {
+                    drop_region = true;
+                }
+                written
+            }
+        } else {
+            Some(Vec::new())
+        };
+        let Some(guarded) = guarded else {
+            drop(journal);
+            if drop_region && let Some(r) = region {
+                forget_region(r.base);
+            }
+            return None;
+        };
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Watches, 1);
+            add(C::WatchUs, started.elapsed().as_micros() as u64);
+            slow(started.elapsed().as_micros() as u64);
+        }
+        j.asked += 1;
+        let now = j.asked;
+        if !failed && j.kept && asked_range != (first, last) {
+            j.ahead_asked = now;
+            j.ahead.push(asked_range);
+        }
+        let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
+        for page in pages.collect::<Vec<_>>() {
+            j.written.insert(page, now);
+        }
+        Some((
+            now,
             j.written
                 .range(first..last)
                 .map(|(&p, &w)| (p, w))
                 .collect(),
-        ));
-    }
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    let guarded = if failed {
-        count = 0;
-        if !guarded {
-            return None;
-        }
-        #[cfg(feature = "diagnostics")]
-        let guarding = std::time::Instant::now();
-        let written = guard(first * PAGE, last * PAGE);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(
-            crate::copystat::C::GuardUs,
-            guarding.elapsed().as_micros() as u64,
-        );
-        written?
-    } else {
-        Vec::new()
+        ))
     };
-    #[cfg(feature = "diagnostics")]
-    {
-        use crate::copystat::{C, add};
-        add(C::Watches, 1);
-        add(C::WatchUs, started.elapsed().as_micros() as u64);
-        slow(started.elapsed().as_micros() as u64);
+    if drop_region && let Some(r) = region {
+        forget_region(r.base);
     }
-    j.asked += 1;
-    let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
-    }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    out
 }
 
 /// Guarded blocks of view memory.
@@ -406,7 +552,12 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
+#[cfg(test)]
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    guard_checked(start, end, false)
+}
+
+fn guard_checked(start: usize, end: usize, known_mapped: bool) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -415,12 +566,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known =
-        !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-            let g = guards();
-            let first = start / BLOCK;
-            g.protected.contains(&first) || g.absent.contains(&first)
-        };
+    let known = known_mapped
+        || (!*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
+            && {
+                let g = guards();
+                let first = start / BLOCK;
+                g.protected.contains(&first) || g.absent.contains(&first)
+            });
     if !known && !is_view(start, end) {
         return None;
     }
@@ -653,6 +805,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    REGIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);

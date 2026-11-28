@@ -3730,9 +3730,7 @@ mod tests {
         // The draws: a triangle over the target at the depth of a class,
         // as the title's lighting places its rectangles.
         const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants = 1, b0)"
 cbuffer Drawn : register(b0) { uint number; };
-[RootSignature(RS)]
 float4 corner(uint i : SV_VertexID) : SV_Position {
     float z = float(number) * asfloat(0x37800080);
     return float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, z, 1.0);
@@ -3749,10 +3747,19 @@ float4 lit() : SV_Target { return 1.0; }
         blend.RenderTarget[0].RenderTargetWriteMask = 0xf;
         let mut formats = [DXGI_FORMAT(0); 8];
         formats[0] = DXGI_FORMAT(61);
+        let signature = crate::host::create_root_signature(
+            &host.device,
+            &[crate::host::root_constants(
+                0,
+                1,
+                D3D12_SHADER_VISIBILITY_ALL,
+            )],
+            &[],
+            D3D12_ROOT_SIGNATURE_FLAG_NONE,
+        )
+        .unwrap();
         // SAFETY: plain creation; the description points at live data.
-        let (signature, pipeline) = unsafe {
-            let signature: ID3D12RootSignature =
-                host.device.CreateRootSignature(0, &vs[..]).unwrap();
+        let pipeline: ID3D12PipelineState = unsafe {
             let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&signature),
                 VS: code(&vs[..]),
@@ -3782,9 +3789,7 @@ float4 lit() : SV_Target { return 1.0; }
                 },
                 ..Default::default()
             };
-            let pipeline: ID3D12PipelineState =
-                host.device.CreateGraphicsPipelineState(&desc).unwrap();
-            (signature, pipeline)
+            host.device.CreateGraphicsPipelineState(&desc).unwrap()
         };
         let state = host_copy(depth).unwrap().state.load(Relaxed);
         let state = D3D12_RESOURCE_STATES(state as i32);

@@ -61,6 +61,37 @@ pub fn current() -> Console {
     }
 }
 
+fn parse_mb(value: &str) -> Option<u64> {
+    value
+        .parse::<u64>()
+        .ok()
+        .and_then(|mb| mb.checked_mul(1 << 20))
+        .filter(|&bytes| bytes > 0)
+}
+
+fn mb_override(name: &str) -> Option<u64> {
+    std::env::var(name).ok().as_deref().and_then(parse_mb)
+}
+
+fn apply_env_overrides(
+    limits: &mut Limits,
+    dedicated_video_memory: u64,
+    texture_bytes: Option<u64>,
+    host_copy_bytes: Option<u64>,
+) {
+    if let Some(bytes) = texture_bytes {
+        let maximum = if dedicated_video_memory > 0 {
+            dedicated_video_memory / 4
+        } else {
+            512 << 20
+        };
+        limits.texture_bytes = bytes.min(maximum).max(1);
+    }
+    if let Some(bytes) = host_copy_bytes {
+        limits.host_copy_bytes = bytes;
+    }
+}
+
 /// The profile's caps for this process. Resolved once, from the request and
 /// the host's facts, and logged once.
 pub fn limits() -> &'static Limits {
@@ -69,19 +100,12 @@ pub fn limits() -> &'static Limits {
         let facts = device_facts();
         let resolved = victory_core::memory::resolve(victory_core::memory::request(), facts);
         let mut limits = Limits::for_profile(resolved.profile, facts);
-        if let Some(bytes) = std::env::var("VICTORY_TEXTURE_MB")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .and_then(|mb| mb.checked_mul(1 << 20))
-            .filter(|&bytes| bytes > 0)
-        {
-            let maximum = if facts.dedicated_video_memory > 0 {
-                facts.dedicated_video_memory / 4
-            } else {
-                512 << 20
-            };
-            limits.texture_bytes = bytes.min(maximum).max(1);
-        }
+        apply_env_overrides(
+            &mut limits,
+            facts.dedicated_video_memory,
+            mb_override("VICTORY_TEXTURE_MB"),
+            mb_override("VICTORY_HOST_COPIES_MB"),
+        );
         tracing::info!(
             profile = limits.profile.as_str(),
             why = resolved.why.as_str(),
@@ -211,5 +235,27 @@ mod tests {
         let resolved = victory_core::memory::resolve(ProfileRequest::Auto, facts);
         assert_eq!(resolved.profile, MemoryProfile::SeriesS);
         assert_eq!(resolved.why, Why::DedicatedVideoMemory);
+    }
+
+    #[test]
+    fn host_copies_override_lifts_the_series_s_cap_only_when_positive() {
+        let mut limits = Limits::for_profile(
+            MemoryProfile::SeriesS,
+            DeviceFacts {
+                dedicated_video_memory: 8 * (1 << 30),
+                ..Default::default()
+            },
+        );
+        let original = limits.host_copy_bytes;
+        assert_eq!(original, 5 * (1 << 30) / 2);
+        assert_eq!(parse_mb("0"), None);
+        assert_eq!(parse_mb("bad"), None);
+        assert_eq!(parse_mb("4096"), Some(4096 << 20));
+
+        apply_env_overrides(&mut limits, 8 * (1 << 30), None, parse_mb("0"));
+        assert_eq!(limits.host_copy_bytes, original);
+
+        apply_env_overrides(&mut limits, 8 * (1 << 30), None, parse_mb("4096"));
+        assert_eq!(limits.host_copy_bytes, 4096 << 20);
     }
 }

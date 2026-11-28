@@ -219,6 +219,7 @@ see `victory.example.toml` and `docs/architecture.md`.
 | `VICTORY_BVH_BUDGET=N` | numeric budget for `limited` |
 | `VICTORY_AMBIENT_FALLBACK=off/auto/0.0..1.0` | constant indirect-light fallback; auto enables 0.2 on Polaris |
 | `VICTORY_TEXTURE_MB=1536` | sampled-texture budget in MiB, bounded to one quarter of physical VRAM; launcher default for the 8 GiB RX 570 |
+| `VICTORY_HOST_COPIES_MB=N` | override the profile's host-copy RAM budget in MiB (default `2560` under `series-s`) |
 | `VICTORY_PORT_CONSTANTS=1` | GPU reads and writes a contiguous low-address constants section in place; falls back to copies if opening it fails |
 | `VICTORY_WINDOW_TAILS=1` | omit unused prefixes of root-view memory windows |
 | `VICTORY_CARD_BUFFERS_MB=768` | launcher budget for buffer copies held in VRAM |
@@ -230,6 +231,7 @@ see `victory.example.toml` and `docs/architecture.md`.
 - `docs/architecture.md` — translation layer architecture
 - `docs/mesh-fallback.md` — compute mesh fallback subset and scheduling
 - `docs/fork-ray-tracing.md` — BVH/RT translation status
+- `docs/linux-proton.md` — cross-building and running on Linux via Steam Proton
 - `docs/asset-policy.md` — no game assets in this repository
 - [AMD fork comparison and RX 570 fixes](docs/amd-comparison-2026-11-27.md)
 - [RX 570 Shader Model and Agility investigation](docs/rx570-agility.md)

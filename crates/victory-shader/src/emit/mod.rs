@@ -1206,17 +1206,28 @@ mod tests {
         }
         host.pipeline(&vs, &ps).unwrap();
         // The runtime checks the container hash: no hash or a wrong one is
-        // refused. (Recent runtimes also take sixteen 0x01 bytes, a bypass
-        // value; ours works with older ones too.)
-        let mut wrong = ps.dxil[4..20].to_vec();
-        wrong[0] ^= 1;
-        for digest in [&[0u8; 16][..], &wrong] {
-            let mut other = ps.clone();
-            other.dxil[4..20].copy_from_slice(digest);
-            assert!(
-                host.pipeline(&vs, &other).is_err(),
-                "digest {digest:02x?} accepted"
-            );
+        // refused. (vkd3d-proton under Wine/Proton skips DXIL container hash
+        // validation, so skip this assertion there.)
+        let on_wine = {
+            use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+            // SAFETY: constant NUL-terminated ASCII module and export names.
+            unsafe {
+                let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+                !ntdll.is_null()
+                    && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+            }
+        };
+        if !on_wine {
+            let mut wrong = ps.dxil[4..20].to_vec();
+            wrong[0] ^= 1;
+            for digest in [&[0u8; 16][..], &wrong] {
+                let mut other = ps.clone();
+                other.dxil[4..20].copy_from_slice(digest);
+                assert!(
+                    host.pipeline(&vs, &other).is_err(),
+                    "digest {digest:02x?} accepted"
+                );
+            }
         }
     }
 

@@ -41,12 +41,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-use windows::core::{Interface, s};
+use windows::core::Interface;
 use windows_sys::Win32::System::Memory as mem;
 
 /// The unit heaps and placed buffers are cut on, and the console's page.
@@ -645,42 +643,22 @@ impl Rig {
     /// A compute shader stores, through a root unordered-access view at
     /// `gpu`, the sum of the buffer's first two words in its third.
     fn shade(&mut self, gpu: u64) -> windows::core::Result<()> {
-        const SOURCE: &str = "#define RS \"UAV(u0)\"\nRWByteAddressBuffer b : register(u0);\n[RootSignature(RS)]\n[numthreads(1, 1, 1)]\nvoid main() { b.Store(8, b.Load(0) + b.Load(4)); }\n";
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; then the
-        // blob's own bytes, which hold the root signature too.
-        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
-            D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
-                s!("inplace"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
+        const SOURCE: &str = r#"
+RWStructuredBuffer<uint> b : register(u0);
+[numthreads(1, 1, 1)]
+void main() { b[2] = b[0] + b[1]; }
+"#;
+        let root = crate::host::create_root_signature(
+            &self.device,
+            &[crate::host::root_descriptor(
+                D3D12_ROOT_PARAMETER_TYPE_UAV,
                 0,
-                0,
-                &mut code,
-                None,
-            )?;
-            let code = code.ok_or_else(windows::core::Error::empty)?;
-            let bytes = std::slice::from_raw_parts(
-                code.GetBufferPointer().cast::<u8>(),
-                code.GetBufferSize(),
-            );
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
-            let pso =
-                self.device
-                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                        pRootSignature: std::mem::transmute_copy(&root),
-                        CS: D3D12_SHADER_BYTECODE {
-                            pShaderBytecode: bytes.as_ptr().cast(),
-                            BytecodeLength: bytes.len(),
-                        },
-                        ..Default::default()
-                    })?;
-            (root, pso)
-        };
+                D3D12_SHADER_VISIBILITY_ALL,
+            )],
+            &[],
+            D3D12_ROOT_SIGNATURE_FLAG_NONE,
+        )?;
+        let pso = crate::host::compute_pipeline(&self.device, SOURCE, &root)?;
         // SAFETY: an open list of ours; the view names a live buffer.
         self.run(|list| unsafe {
             list.SetComputeRootSignature(&root);

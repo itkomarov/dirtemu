@@ -3737,7 +3737,10 @@ mod pressure_tests {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
             let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
             let description = adapter.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap();
-            assert_ne!(description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
+            // DXVK returns the first hardware adapter for EnumWarpAdapter under Proton.
+            if !crate::host::on_wine() {
+                assert_ne!(description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
+            }
             let mut device = None;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device).unwrap();
             device.unwrap()

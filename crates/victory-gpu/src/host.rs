@@ -1028,17 +1028,13 @@ float4 corner(uint i : SV_VertexID) : SV_Position {
 }
 "#;
 const PLANE_STEPS: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
 Texture2DArray<uint> twin : register(t0);
-[RootSignature(RS)]
 float plane(float4 p : SV_Position) : SV_Depth {
     return float(twin.Load(int4(int2(p.xy), 0, 0))) * asfloat(0x37800080);
 }
 "#;
 const PLANE_FLOATS: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
 Texture2DArray<float> twin : register(t0);
-[RootSignature(RS)]
 float plane(float4 p : SV_Position) : SV_Depth {
     return twin.Load(int4(int2(p.xy), 0, 0));
 }
@@ -1101,22 +1097,48 @@ fn plane_pass() -> Option<&'static PlanePass> {
 
 /// Compiles function `entry` of `source` for `target` with the system's
 /// compiler, as the indirect-argument clamp is (`crate::indirect`).
+/// Whether this process runs under Wine/Proton (its `ntdll.dll` exports
+/// `wine_get_version`).
+pub(crate) fn on_wine() -> bool {
+    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WINE.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: constant NUL-terminated ASCII module and export names.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    })
+}
+
 pub(crate) fn compile(
     source: &str,
     entry: windows::core::PCSTR,
     target: windows::core::PCSTR,
 ) -> windows::core::Result<Vec<u8>> {
+    use windows::Win32::Graphics::Direct3D::D3D_SHADER_MACRO;
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
+    // vkd3d-shader rejects `[allow_uav_condition]`, which Microsoft's FXC uses
+    // on UAV polling loops.
+    let wine_macros = [
+        D3D_SHADER_MACRO {
+            Name: windows::core::s!("VICTORY_NO_ALLOW_UAV_CONDITION"),
+            Definition: windows::core::s!("1"),
+        },
+        D3D_SHADER_MACRO::default(),
+    ];
+    let defines = on_wine().then_some(wine_macros.as_ptr());
+    // SAFETY: the source, names, and optional macro array live through the call;
+    // out pointers are ours.
     let compiled = unsafe {
         D3DCompile(
             source.as_ptr().cast(),
             source.len(),
             windows::core::s!("victory"),
-            None,
+            defines,
             None,
             entry,
             target,
@@ -1145,6 +1167,129 @@ pub(crate) fn compile(
         std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
     };
     Ok(bytes.to_vec())
+}
+
+/// Serializes and creates a root signature directly from descriptors rather than
+/// embedding `[RootSignature(...)]` in HLSL, which Proton's `d3dcompiler_47`
+/// (`vkd3d-shader`) ignores.
+pub(crate) fn create_root_signature(
+    device: &ID3D12Device,
+    params: &[D3D12_ROOT_PARAMETER],
+    samplers: &[D3D12_STATIC_SAMPLER_DESC],
+    flags: D3D12_ROOT_SIGNATURE_FLAGS,
+) -> windows::core::Result<ID3D12RootSignature> {
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: params.len() as u32,
+        pParameters: if params.is_empty() {
+            std::ptr::null()
+        } else {
+            params.as_ptr()
+        },
+        NumStaticSamplers: samplers.len() as u32,
+        pStaticSamplers: if samplers.is_empty() {
+            std::ptr::null()
+        } else {
+            samplers.as_ptr()
+        },
+        Flags: flags,
+    };
+    // SAFETY: `params` and `samplers` live across serialization, and `blob` is
+    // read completely before it drops.
+    unsafe {
+        let mut blob: Option<ID3DBlob> = None;
+        D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)?;
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
+    }
+}
+
+pub(crate) fn root_constants(
+    shader_register: u32,
+    num_values: u32,
+    visibility: D3D12_SHADER_VISIBILITY,
+) -> D3D12_ROOT_PARAMETER {
+    D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Constants: D3D12_ROOT_CONSTANTS {
+                ShaderRegister: shader_register,
+                RegisterSpace: 0,
+                Num32BitValues: num_values,
+            },
+        },
+        ShaderVisibility: visibility,
+    }
+}
+
+pub(crate) fn root_descriptor(
+    parameter_type: D3D12_ROOT_PARAMETER_TYPE,
+    shader_register: u32,
+    visibility: D3D12_SHADER_VISIBILITY,
+) -> D3D12_ROOT_PARAMETER {
+    D3D12_ROOT_PARAMETER {
+        ParameterType: parameter_type,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR {
+                ShaderRegister: shader_register,
+                RegisterSpace: 0,
+            },
+        },
+        ShaderVisibility: visibility,
+    }
+}
+
+/// Compiles `source` (`main`, `cs_5_1`) and creates a compute pipeline against
+/// `root`.
+pub(crate) fn compute_pipeline(
+    device: &ID3D12Device,
+    source: &str,
+    root: &ID3D12RootSignature,
+) -> windows::core::Result<ID3D12PipelineState> {
+    let bytes = compile(
+        source,
+        windows::core::s!("main"),
+        windows::core::s!("cs_5_1"),
+    )?;
+    // SAFETY: `root` and `bytes` live across `CreateComputePipelineState`.
+    unsafe {
+        device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(root),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: bytes.as_ptr().cast(),
+                BytecodeLength: bytes.len(),
+            },
+            ..Default::default()
+        })
+    }
+}
+
+/// Root signature for [`CARD_COMPARE`]: 6 constants `b0`, SRV `t0`, UAV `u0`,
+/// and UAV `u1`.
+pub(crate) fn card_compare_root(
+    device: &ID3D12Device,
+) -> windows::core::Result<ID3D12RootSignature> {
+    let params = [
+        root_constants(0, 6, D3D12_SHADER_VISIBILITY_ALL),
+        root_descriptor(
+            D3D12_ROOT_PARAMETER_TYPE_SRV,
+            0,
+            D3D12_SHADER_VISIBILITY_ALL,
+        ),
+        root_descriptor(
+            D3D12_ROOT_PARAMETER_TYPE_UAV,
+            0,
+            D3D12_SHADER_VISIBILITY_ALL,
+        ),
+        root_descriptor(
+            D3D12_ROOT_PARAMETER_TYPE_UAV,
+            1,
+            D3D12_SHADER_VISIBILITY_ALL,
+        ),
+    ];
+    create_root_signature(device, &params, &[], D3D12_ROOT_SIGNATURE_FLAG_NONE)
 }
 
 impl PlanePass {
@@ -1177,14 +1322,30 @@ impl PlanePass {
         let vs = compile(PLANE_CORNERS, s!("corner"), s!("vs_5_1"))?;
         let source = if steps { PLANE_STEPS } else { PLANE_FLOATS };
         let ps = compile(source, s!("plane"), s!("ps_5_1"))?;
+        let range = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+        };
+        let params = [D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: &range,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        }];
+        let root = create_root_signature(device, &params, &[], D3D12_ROOT_SIGNATURE_FLAG_NONE)?;
         let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
         };
-        // SAFETY: the root signature is inside the pixel shader; the
-        // description points at live data and never releases its pointer.
+        // SAFETY: `range`, `root`, `vs`, and `ps` live across PSO creation.
         unsafe {
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
             let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 VS: code(&vs[..]),
@@ -1696,7 +1857,6 @@ static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 /// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
 /// byte just outside the range costs a fetch that finds nothing.
 pub(crate) const CARD_COMPARE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
     uint first;    // the first piece
     uint skew;     // where the copy starts in its piece 0
@@ -1705,17 +1865,18 @@ cbuffer Span : register(b0) {
     uint out_at;   // the first piece's dword in `differs`, in bytes
     uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
 };
-ByteAddressBuffer now : register(t0);
-// 16 bytes per piece of the copy: the hash of its bytes when they were
-// last sent up (or hashed whole, the first time).
-RWByteAddressBuffer hashes : register(u0);
-RWByteAddressBuffer differs : register(u1);
+// Word-structured buffers work under both Microsoft D3DCompile and Proton's
+// vkd3d-shader (which rejects RWByteAddressBuffer methods).
+StructuredBuffer<uint> now : register(t0);
+// 16 bytes (4 words) per piece of the copy: the hash of its bytes when they
+// were last sent up (or hashed whole, the first time).
+RWStructuredBuffer<uint> hashes : register(u0);
+RWStructuredBuffer<uint> differs : register(u1);
 groupshared uint4 partial[64];
 uint4 mix_hash(uint4 h, uint4 value) {
     h = (h ^ value) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
     return h.yzwx ^ (h >> 15);
 }
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
     if (group.x >= pieces) return;
@@ -1727,21 +1888,33 @@ void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
     hi = (hi + 15u) & ~15u;
     uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
     [loop]
-    for (uint at = lo + lane * 16u; at < hi; at += 64u * 16u)
-        h = mix_hash(h, now.Load4(at));
+    for (uint at = lo + lane * 16u; at < hi; at += 64u * 16u) {
+        uint w = at >> 2;
+        h = mix_hash(h, uint4(now[w], now[w + 1u], now[w + 2u], now[w + 3u]));
+    }
     partial[lane] = h;
     GroupMemoryBarrierWithGroupSync();
     if (lane != 0u) return;
     [loop]
     for (uint other = 1u; other < 64u; ++other)
         h = mix_hash(h, partial[other]);
+    uint hw = piece * 4u;
+    uint4 stored = uint4(hashes[hw], hashes[hw + 1u], hashes[hw + 2u], hashes[hw + 3u]);
     if (compare != 0u) {
-        differs.Store(out_at + group.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        differs[(out_at >> 2) + group.x] = any(h != stored) ? 1u : 0u;
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
+        if (compare == 2u) {
+            hashes[hw] = h.x;
+            hashes[hw + 1u] = h.y;
+            hashes[hw + 2u] = h.z;
+            hashes[hw + 3u] = h.w;
+        }
     } else {
-        hashes.Store4(piece * 16u, h);
+        hashes[hw] = h.x;
+        hashes[hw + 1u] = h.y;
+        hashes[hw + 2u] = h.z;
+        hashes[hw + 3u] = h.w;
     }
 }
 "#;
@@ -3232,27 +3405,8 @@ impl Host {
     }
 
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the out
-        // pointer is ours.
-        unsafe {
-            D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
-                windows::core::s!("card compare"),
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-        }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
+        let root = card_compare_root(&self.device)?;
+        let pso = compute_pipeline(&self.device, CARD_COMPARE, &root)?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
@@ -3261,36 +3415,17 @@ impl Host {
             .shared_buffer(RESULTS)
             .ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
-        // SAFETY: the blob's own bytes; the root signature is inside the
-        // shader.
-        unsafe {
-            let bytes = std::slice::from_raw_parts(
-                code.GetBufferPointer().cast::<u8>(),
-                code.GetBufferSize(),
-            );
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
-            let pso: ID3D12PipelineState =
-                self.device
-                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                        pRootSignature: std::mem::transmute_copy(&root),
-                        CS: D3D12_SHADER_BYTECODE {
-                            pShaderBytecode: bytes.as_ptr().cast(),
-                            BytecodeLength: bytes.len(),
-                        },
-                        ..Default::default()
-                    })?;
-            Ok(CardWork {
-                sync: vec![list()?],
-                check: vec![list()?],
-                fetch: list()?,
-                root,
-                pso,
-                differs: (differs, data as usize, RESULTS),
-                fetched: None,
-                taken: 0,
-                out: 0,
-            })
-        }
+        Ok(CardWork {
+            sync: vec![list()?],
+            check: vec![list()?],
+            fetch: list()?,
+            root,
+            pso,
+            differs: (differs, data as usize, RESULTS),
+            fetched: None,
+            taken: 0,
+            out: 0,
+        })
     }
 
     /// Before a submission's lists run, for copies in the card's memory
